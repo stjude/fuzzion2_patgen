@@ -9511,8 +9511,9 @@ sub collapse_features {
   my %features;
   foreach my $pair (@{$set_in}) {
     my $sides = split_pair($pair);
-    my @side_a = split /\//, $sides->[0];
-    my @side_b = split /\//, $sides->[1];
+    my @side_a = split /\//, $sides->[0], 3;
+    my @side_b = split /\//, $sides->[1], 3;
+    # explicit 3: sometimes only the gene symbol is populated
 
     my $key_pair = join "/", @side_a[0,1], @side_b[0,1];
     $features{$key_pair}{A}{$side_a[2]} = 1;
