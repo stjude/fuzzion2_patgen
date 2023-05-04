@@ -9539,7 +9539,10 @@ sub split_pair {
   my @sides = split /\-/, $pair;
   unless (@sides == 2) {
     # ANKHD1-EIF4EBP3/NM_020690.6/exon_1-ARHGAP26/NM_001135608.3/exon_5
-    $pair =~ /^(\S+\/\S+\/\S+)\-(\S+\/\S+\/\S+)$/ || confess "failed match $pair";
+#    $pair =~ /^(\S+\/\S+\/\S+)\-(\S+\/\S+\/\S+)$/ || confess "failed match $pair";
+    $pair =~ /^(\S+\/\S*\/\S*)\-(\S+\/\S*\/\S*)$/ || confess "failed match $pair";
+    # not guaranteed to be > 0 length:
+    # RNU6-1_locC|RNU6-7_locC|RNU6-8_locC|RNU6-2_locC|RNU6-9_locC//-SNORA53/NR_003015/5utr_1
     @sides = ($1, $2);
   }
   return \@sides;
