@@ -13,6 +13,7 @@ use Carp qw(confess);
 use Getopt::Long;
 use File::Basename;
 use File::Copy;
+use Cwd qw(realpath);
 
 use Digest::MD5 qw(md5_hex);
 use Set::IntSpan;
@@ -494,6 +495,8 @@ my @clopts = (
 
 	      "-add-preferred-key=s",
 	      "-generate-transcript-info",
+
+	      "-patch-breakpoints=s",
 	     );
 GetOptions(
 	   \%FLAGS,
@@ -558,6 +561,9 @@ if ($FLAGS{"gencode2refflat"}) {
   exit(0);
 } elsif ($FLAGS{"add-preferred-key"}) {
   add_preferred_key();
+  exit(0);
+} elsif ($FLAGS{"patch-breakpoints"}) {
+  patch_breakpoints();
   exit(0);
 }
 
@@ -2461,6 +2467,8 @@ sub convert_fuzzion {
 
   my $REPORT_SAMPLE = 1;
   my $REPORT_SOURCE = 1;
+
+  die "4/2023: FIX: now must clone chr and pos too!!";
   my @REPORT_CLONE_FIELDS = qw(
 				genea_symbol
 				genea_acc
@@ -2473,6 +2481,8 @@ sub convert_fuzzion {
 				gene_pair_summary
 				pathogenicity_somatic
 			     );
+  # output is only a subset of the inputs, as these will be
+  # in varying formats depending on origin and conversion method
 
   my $found_extra_source;
 
@@ -9275,16 +9285,22 @@ sub add_preferred_key {
   # Also include a single-column version for simple grouping.
   my $f_in = $FLAGS{"add-preferred-key"} || die;
   my $generate_transcript_info = $FLAGS{"generate-transcript-info"};
+  my $dwim_checked;
 
-  my ($f_gene_a, $f_gene_b);
   if ($generate_transcript_info) {
     # assumes CICERO format
-    $f_gene_a = "geneA";
-    $f_gene_b = "geneB";
+    $F_GENE_A = "geneA";
+    $F_GENE_B = "geneB";
+    # these additional fields only required for generate_transcript_info()
+    # call below:
+    $F_CHR_A = "chrA";
+    $F_CHR_B = "chrB";
+    $F_POS_A = "posA";
+    $F_POS_B = "posB";
   } else {
     # fz2 pattern annotations
-    $f_gene_a = "genea_symbol";
-    $f_gene_b = "geneb_symbol";
+    $F_GENE_A = "genea_symbol";
+    $F_GENE_B = "geneb_symbol";
   }
 
   init_sjpi();
@@ -9318,7 +9334,27 @@ sub add_preferred_key {
 
   # while (my $row = $df->next("-ref" => 1)) {  # headerless
   while (my $row = $df->get_hash()) {
-    generate_transcript_info($row) if $generate_transcript_info;
+
+    if ($generate_transcript_info) {
+      unless ($dwim_checked) {
+	# munge header name capitalization, e.g. for formatting changes
+	# between cicero and cicero-post output files, which I'm sure
+	# were made for a very important and well-thought-out reason
+	field_name_dwim(
+			"-query" => [
+				     \$F_CHR_A,
+				     \$F_POS_A,
+				     \$F_GENE_A,
+				     \$F_CHR_B,
+				     \$F_POS_B,
+				     \$F_GENE_B,
+				    ],
+			"-actual" => $df->headers_raw(),
+		       );
+	$dwim_checked = 1;
+      }
+      generate_transcript_info($row);
+    }
     dump_die($row, "no gene_pair_summary field") unless exists $row->{gene_pair_summary};
     my @set = split /,/, $row->{gene_pair_summary};
 
@@ -9402,8 +9438,8 @@ sub add_preferred_key {
       ($b_gene, $b_transcript, $b_feature) = split /\//, $sides->[1];
     } else {
       # can happen: use gene symbol from main annotation + "unknown"?
-      $a_gene = $row->{$f_gene_a} || die;
-      $b_gene = $row->{$f_gene_b} || die;
+      $a_gene = $row->{$F_GENE_A} || die;
+      $b_gene = $row->{$F_GENE_B} || die;
       $gte_rank = 300;
       # no isoform data
     }
@@ -9513,12 +9549,13 @@ sub split_pair {
 sub generate_transcript_info {
   # generate "gene_pair_summary" field for CIERO input
   my ($row) = @_;
-  my $gene_a = $row->{geneA} || die;
-  my $gene_b = $row->{geneB} || die;
-  my $chr_a = $row->{chrA} || die;
-  my $chr_b = $row->{chrB} || die;
-  my $pos_a = $row->{posA} || die;
-  my $pos_b = $row->{posB} || die;
+
+  my $gene_a = $row->{$F_GENE_A} || die;
+  my $gene_b = $row->{$F_GENE_B} || die;
+  my $chr_a = $row->{$F_CHR_A} || die;
+  my $chr_b = $row->{$F_CHR_B} || die;
+  my $pos_a = $row->{$F_POS_A} || die;
+  my $pos_b = $row->{$F_POS_B} || die;
   # TO DO: ADJUST positions for feature-tracking purposes?
 
   $rf = get_refflat() unless $rf;
@@ -9654,5 +9691,126 @@ sub conditional_noncoding_filter {
 #    printf STDERR "keep %d NM_, discard %d other\n", scalar(@nm), scalar @other;
     @{$set_ref} = @nm;
   }
+
+}
+
+
+sub patch_breakpoints {
+  # hack to patch genomic breakpoint info from intermediate files
+  # back into curated pattern file
+  my $f_in = $FLAGS{"patch-breakpoints"} || die;
+  # file to patch
+
+  my @pattern_src_files = qw(infiles.txt infiles_rna.txt);
+  # symlinks
+  my $src_dir = dirname(realpath($pattern_src_files[0]));
+
+  #
+  #  load pre-breakpoint annotation extended pattern sequences:
+  #
+  my %index;
+ LOAD:
+  foreach my $listfile (@pattern_src_files) {
+    my $files = read_simple_file($listfile);
+    foreach my $src_raw (@{$files}) {
+      my $f_pattern = sprintf "%s/%s.extended.tab.extended_500.pattern.tab",
+	$src_dir, basename($src_raw);
+      # intermediate output file with extended sequence
+      die "where is $f_pattern" unless -s $f_pattern;
+
+      if (0 and %index) {
+	printf STDERR "DEBUG, quitting load\n";
+	last LOAD;
+      }
+      printf STDERR "loading %s\n", $f_pattern;
+
+      my $df = new DelimitedFile(
+				 "-file" => $f_pattern,
+				 "-headers" => 1,
+				);
+      while (my $row = $df->get_hash()) {
+	die unless exists $row->{extended_500};
+	my $seq = $row->{extended_500};
+	if ($seq) {
+	  # not every row will have one
+	  $seq = uc($seq);
+	  $row->{src_file} = $f_pattern;
+	  push @{$index{$seq}}, $row;
+	}
+      }
+    }
+  }
+
+  #
+  #  map final patterns back to intermediate row(s)
+  #
+  my $df = new DelimitedFile("-file" => $f_in,
+			     "-headers" => 1,
+			     );
+  my $outfile = basename($f_in) . ".breakpoints.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $outfile,
+			      "-extra" => [
+					   qw(
+					       breakpoints_raw
+					       breakpoints_adj
+					       breakpoints_src
+					    )
+					  ],
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+
+  while (my $row = $df->get_hash()) {
+    my $pattern = $row->{sequence} || die;
+    # fz2 pattern sequence, required
+
+    $pattern =~ tr/[]{}//d || die;
+    # remove (required) fz2 breakpoint markers
+    $pattern = uc($pattern);
+    # just to be sure
+
+    my %bp_raw;
+    my %bp_adj;
+    my %src;
+    if (my $hits = $index{$pattern}) {
+      foreach my $h (@{$hits}) {
+	my $chrA = $h->{chrA} || dump_die($row, "no chrA");
+	my $chrB = $h->{chrB} || die;
+	my $posA_raw = $h->{posA} || die;
+	my $posB_raw = $h->{posB} || die;
+	my $posA_adj = $h->{genea_pos_adj} || die;
+	my $posB_adj = $h->{geneb_pos_adj} || die;
+
+	my $breakpoint_raw = sprintf '%s:%d-%s:%d',
+	  $chrA, $posA_raw,
+	    $chrB, $posB_raw;
+	# TO DO: add genome too?
+	$bp_raw{$breakpoint_raw} = 1;
+
+	my $breakpoint_adj = sprintf '%s:%d-%s:%d',
+	  $chrA, $posA_adj,
+	    $chrB, $posB_adj;
+	$bp_adj{$breakpoint_adj} = 1;
+
+	my $f_src = $h->{src_file} || die;
+	$src{$f_src} = 1;
+      }
+    }
+
+    $row->{breakpoints_raw} = join ",", sort keys %bp_raw;
+    # this might be cleaner if adjusting for minor isoforms clutters the output
+
+    $row->{breakpoints_adj} = join ",", sort keys %bp_adj;
+    # OTOH, for RNA-based data this could potentially be cleaner
+
+    $row->{breakpoints_src} = join ",", sort keys %src;
+    $rpt->end_row($row);
+  }
+
+  $rpt->finish();
+
+
 
 }
