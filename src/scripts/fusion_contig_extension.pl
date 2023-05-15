@@ -611,14 +611,6 @@ my @NEW_HEADERS = (
 # also include "sample" and other fields required by pattern conversion step?
 
 
-printf STDERR "configuration:\n";
-printf STDERR "  restricting to coding transcripts only?: %s\n", $CODING_ONLY ? "y" : "n";
-printf STDERR "  restricting to preferred isoforms only?: %s\n", $FLAGS{"restrict-nm-sjpi"} ? "y" : "n";
-
-#find_binary("blat", "-die" => 1);
-find_binary("blastn", "-die" => 1);
-# not needed for some functions below
-
 if (my $info = $FLAGS{"generate-test-file"}) {
   generate_test_file($info);
   exit(0);
@@ -697,6 +689,12 @@ if (my $info = $FLAGS{"generate-test-file"}) {
   parse_cosmic();
   exit(0);
 }
+
+printf STDERR "configuration:\n";
+printf STDERR "  restricting to coding transcripts only?: %s\n", $CODING_ONLY ? "y" : "n";
+printf STDERR "  restricting to preferred isoforms only?: %s\n", $FLAGS{"restrict-nm-sjpi"} ? "y" : "n";
+
+find_binary("blastn", "-die" => 1);
 
 my $SJPI;
 if ($REPORT_SJPI or $FLAGS{"restrict-nm-sjpi"}) {
