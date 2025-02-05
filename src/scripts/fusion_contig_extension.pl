@@ -20,7 +20,7 @@ use Set::IntSpan;
 use List::Util qw(min max sum);
 use Bio::SeqIO;
 
-use MiscUtils qw(dump_die build_argv_list get_hash_option unquote field_name_dwim);
+use MiscUtils qw(dump_die build_argv_list get_hash_option unquote field_name_dwim unique_ordered_list);
 use DelimitedFile;
 use Reporter;
 use ConfigUtils qw(config_or_manual);
@@ -46,6 +46,8 @@ use GenBankCDS;
 use SortedColumnStreamer;
 use ReadthroughFusionAnnotator;
 use GeneListMatcher;
+use HSPIndexer;
+use DuplicationAlignment;
 
 my %FLAGS;
 
@@ -83,6 +85,9 @@ my $F_CONTIG = "contig";
 my $F_FUSION;
 my $F_SAMPLE = "sample";
 my $F_SOURCE = "source";
+
+my $F_ITD_FEATURES = "itd_features";
+# field only used by ITD/intragenic processing type
 
 my ($F_CHR_A, $F_POS_A, $F_ORT_A,
     $F_CHR_B, $F_POS_B, $F_ORT_B);
@@ -176,9 +181,17 @@ my $BLAST_MIN_WORD_SIZE = 20;
 # because specifying a value of 11 does work (interestingly) but not
 # specifying -word_size at all does not.
 
-my $BLAST_GAP_OPEN;
-my $BLAST_GAP_EXTEND;
-# optional parameters to blastn for gap open/extend penalties
+#my $BLAST_GAP_OPEN;
+#my $BLAST_GAP_EXTEND;
+my $BLAST_GAP_OPEN = 3;
+my $BLAST_GAP_EXTEND = 2;
+# optional parameters to blastn for gap open/extend penalties.
+# See test_UBTF_gapopen3_gapext_2.tab: example where minimum 3/2 seems
+# like a good idea to suppress an interfering gap between the query
+# and the subject.  Setting a minimum helps suppress noise near edges
+# which are especially problematic.  While the code can automatically
+# resolve some of these problems, large-ish gaps may still cause
+# problems and it seems better to suppress them during alignment
 
 my $LARGE_ITD_ADD_FLANKING = 50;
 
@@ -210,6 +223,12 @@ my $RNA_INTRAGENIC_MIN_DISTANCE_TO_PROCESS = 2500;
 # if RNA intragenic events are not suppressed completely, events where
 # distances are shorter than this are considered unprocessable as they
 # may be ITDs (these only currently work in contig mode)
+
+my $RNA_SUPPRESS_DISTANT_ISOFORMS = 1;
+# if a coordinate is near to exons in some isoforms but distant in
+# others, only use the nearby isoforms
+my $RNA_DISTANT_THRESHOLD = 20;
+# TBD
 
 my $F_PATTERN_ID = "pattern";
 my $F_PATTERN_SEQUENCE = "sequence";
@@ -265,14 +284,18 @@ my $DEEP_INTRONIC_MIN_CONTIG_SIDE_FRACTION = 0.70;
 # RNA pattern).
 
 my $RNA_ADD_GENE_ANNOTATIONS = 1;
-# attempt to add gene symbol annotations if missing
+# add/update genes and strand info if necessary
+my $RNA_KEEP_GENE_ANNOTATIONS = 1;
+# by default, keep any existing gene and strand annotation.
+# the strand annotation in particular is critical information, if available.
+
 my $RNA_FIX_GENE_ANNOTATIONS = 1;
 # attempt to repair unrecognized/invalid gene symbols, e.g.
 # Excel damage like "5-Sep" for "SEPT5"
 my $RNA_UPDATE_GENE_STRAND = 0;
 # while (re)annotating, also modify strand annotations.
-# a bit risky: inconsistent strand might indicte an antisense event we
-# want to ignore, OTOH it might also be corrupt but salvageble data.
+# Typically we probably DON'T want to do this as there's no guarantee
+# the fusion will be on the same sense as the gene model.
 
 my $DEMUNGE_CHR_23 = 1;
 # sometimes X appears as "chr23" in user data, likewise Y=24
@@ -281,8 +304,213 @@ my $REPORT_SJPI = 1;
 
 my $READTHROUGH_MAX_DISTANCE = 200000;
 
+
+#
+#  parameters for 9/2023 ITD + DUP refactor:
+#
+my $ITD_AMBIGUITY_RESCUE_MAX_MICROHOMOLOGY_SIZE = 5;
+# has been observed.  A few even higher, 6-7.  ?
+
+my $ITD_MIN_SIZE = 10;
+# TBD
+
+my $ITD_RESCUE_MIN_SIZE = 7;
+# see simple_itd_check()
+
+#my $ITD_MAX_QUERY_GAP = 10;
+#my $ITD_MAX_QUERY_GAP = 15;
+my $ITD_MAX_QUERY_GAP = 55;
+# TBD
+# a bit of interstitial sequence is OK, but a lot may indicate
+# intronic sequence in the contig, which implies an incompatible
+# isoform, for example if the contig was based on an isoform
+# with exons that are not present in the isoform being processed.
+# e.g. FGFR1, NM_01354370.2 is missing some exons compare to
+# NM_023110.3, so a contig based on the latter will not align
+# well to the former.
+#
+# OTOH, this can sometimes include a chunk of non-refSeq sequence such
+# as intronic sequence that forms a novel splice site (see
+# test_large_subject_gap_JZ_wants_fusion_pattern_without_intronic.tab
+# which has a 37-nt intronic inclusion).  These may be unique to some
+# samples, in which case a fusion-type pattern (see below) may work
+# better.  There may be no one-size-fits-all solution here.
+
+my $ITD_LARGE_DUP_GENERATE_TWO_PATTERN_STYLES = 1;
+# for large/medium dups, generate two pattern styles,
+# traditional ITD and fusion
+
+my $ITD_MIN_INTERSTITIAL_FOR_ALTERNATE_PATTERN = 8;
+# for the above option, require a minimum interstitial sequence
+# length to trigger generation of an alternate, fusion-style pattern.
+# - if too low (or 0), we are essentially eliminating the overlap
+#   requirement required by ITD-style patterns (sometimes very important
+#   to help eliminate false positives)
+# - if too high, an ITD-only pattern may not work for other samples
+#   where the interstitial sequence is not present
+# => exact threshold TBD!
+
+my $ITD_MIN_BREAKPOINT_DISTANCE_FOR_ALTERNATE_PATTERN = 200;
+# alternate patterns also require some significant distance
+# between the breakpoints in the reference.  Otherwise small
+# duplications can easily yield near-canonical fusion patterns
+# which will produce false positive "strong-" fuzzion2 hits.
+# example: test_KMT2A_small_dup_no_fusion.tab, 54 nt overlap
+# of small exon12->13 duplication.
+
+my $F_INTERNAL_ALT_PATTERN = "__alternate_pattern_generated__";
+# internal tracking tag used in the above case
+
+my $ITD_LARGE_DUP_TREAT_AS_FUSION = 1;
+# if a large duplication is detected, generate a fusion pattern rather
+# than an ITD pattern.  In these cases large query gaps and the
+# resulting interstitial sequence is ignored, because it may be
+# intronic sequence which will never align to the RNA record.
+#
+# The latter is an open question; might these ever be something
+# important, e.g. a bit of retained intron which has some function
+# during protein coding?
+#
+# In a small experiment, removing the interstitial sequence caught
+# a few more samples, whereas the ITD-style pattern caught only
+# the original sample.  The source sample had nowhere near as much
+# supporting data than with the specialized pattern however.
+# A hybrid pattern (interstitial preserved, but fusion-style brackets)
+# may also be worth considering (see 10/27/2023 jz meeting notes)
+
+my $ITD_BRACKET_BOTH_COPIES = 1;
+
+my $ITD_BRACKET_ONE_COPY_IF_DUP_MINIMUM = 20;
+# if we would normally bracket both copies, allow an exception to only
+# bracket one copy if the duplication meets a minimum length.  This
+# helps find evidence for long duplications in short-read sequencing,
+# at the cost of requiring more user interpretation of the results.
+# => some connection with what fuzzion2 considers a strong+ hit?  16 nt?
+
+my $ITD_BRACKET_ONE_COPY_RESCUE = 1;
+#my $ITD_BRACKET_ONE_COPY_RESCUE_MINIMUM = 60;
+my $ITD_BRACKET_ONE_COPY_RESCUE_MINIMUM = 30;
+# EXPERIMENTAL additional rescue:
+# if the final total interstitial sequence is still long,
+# fall back to using BLAST boundaries.  Can rescue e.g.
+# /research/rgs01/home/clusterHome/medmonso/work/steve/2020_06_13_cicero_contig_extension/2021_01_04_all/blast/ITD_refactor/final_set/v2_fixed_annot/FLT3-FLT3-02/src.tab
+
+my $ITD_PURE_INSERTION_MAX_SUBJECT_GAP = 3;
+my $ITD_PURE_DELETION_MAX_QUERY_GAP = 3;
+
+my $ITD_MIN_QUERY_ALIGN_FRACTION = 0.75;
+#my $ITD_MIN_QUERY_ALIGN_FRACTION = 0.70;
+#my $ITD_MIN_QUERY_ALIGN_FRACTION = 0.55;
+# some lower alignment examples involve 5' UTR, so if that is
+# used for alignment this becomes less of an issue.
+
+# contig is expected to generally be a good match to RNA refSeq.
+# If it isn't, that could indicate:
+#  - inappropriate isoform being used for comparison (often works
+#    fine with a different isoform, so this is OK)
+#  - large amount of intronic sequence in contig, e.g.
+#    test_FLT3_4_hsp_with_intronic_sequence.tab
+#
+# Leave some wiggle room in case query sequence contains a novel
+# insertion, or there's a little bit of retained intron, etc.
+
+my $ITD_MERGE_PATTERN_OUTPUT = 0;
+# if there are multiple output rows for the same input row (e.g.
+# for different transcripts) which result in the same pattern,
+# report only one row with column values merged into comma-delimited lists.
+
+my $ITD_COMPLEX_MIN_LENGTH = 9;
+# if a possible complex sub detected, minimum query length affected
+
+my $ITD_INCLUDE_UTR5_IN_MAPPING = 1;
+
+#
+#  preferences for fusion patterns:
+#
+#my $FUSION_MAX_INTERSTITIAL_LENGTH = 10;
+# as with ITDs, long interstitial sequences can suppress legitimate
+# matches in short-read sequencing due to overlap requirements.
+# It's probably safer to trim these a bit more aggressively than
+# intragenic events (especially ITDs).
+my $FUSION_MAX_INTERSTITIAL_LENGTH = 0;
+# 11/14/2024:
+# disable this feature, for two reasons:
+# 1. next version of fz2 will be able to skip over interstitial regions,
+#    we can leave the full sequences in place to demark them.
+# 2. current code doesn't modify/trim the sequence, it just shifts
+#    the breakpoint so that the interstitial is no longer than X nt.
+#    However this is a bad idea as the pattern can then simply fish out
+#    unspliced RNA from total RNA data, leading to many false positives.
+#
+
+my $FUSION_INTERSTITIAL_TRIM_POLICY = "B";
+# B: preserve boundary on B side, trim A side
+# future: maybe consider different policies, e.g. center?
+
+my $FUSION_PREFER_BEST_CONTIG_MATCHES = 1;
+#my $FUSION_PREFER_BEST_CONTIG_MATCHES_BEST_RELATIVE_CUTOFF = 0.90;
+my $FUSION_PREFER_BEST_CONTIG_MATCHES_BEST_RELATIVE_CUTOFF = 0.95;
+# if the contig with the best alignment with the refseqs has X bases,
+# minimum result to include is X * the above.  In other words tolerate
+# a bit of dropoff in alignment coverage vs. the best match, but not much.
+# - tighten from 90 to 95% to catch ETV6-RUNX1 SJBALL032392_D1,
+#   where bogus "interstitial" result has 91% identity
+
+
+my $F_GENOME = "genome";
+# genome version associated with genomic coordinates given
+my $F_PROCESSING_TYPE = "pattern_generation_method";
+my $F_GENE_PAIR_SUMMARY = "gene_pair_summary";
+my $F_GENE_PAIR_SUMMARY_EXTENDED = "gene_pair_summary_extended";
+# including genomic
+my $F_PATHOGENICITY_SOMATIC = "pathogenicity_somatic";
+
+my $F_GENE_PAIR = "gene_pair";
+# for fz2 grouping option
+
+my @H_FZ2_CLONE = (
+		   $F_GENOME,
+		   qw(
+		      genea_symbol
+		      genea_acc
+		      genea_feature
+		      genea_chr
+		      genea_pos
+		      geneb_symbol
+		      geneb_acc
+		      geneb_feature
+		      geneb_chr
+		      geneb_pos
+		    ),
+		   $F_GENE_PAIR_SUMMARY,
+		   $F_GENE_PAIR_SUMMARY_EXTENDED,
+		   $F_PROCESSING_TYPE,
+		   $F_PATHOGENICITY_SOMATIC,
+		  );
+# fields copied verbatim from fz2 intermediate file format into final
+# pattern file.
+
+my @H_FZ2_CORE = (
+		  $F_PATTERN_ID,
+		  $F_PATTERN_SEQUENCE,
+		  # first 2 fields are fixed, required by fuzzion2
+		  $F_GENE_PAIR,
+		  $F_SOURCE,
+		  # file patterns were merged from
+		  $F_SAMPLE,
+		  # TO DO: should this be a clone field?
+		  # or maybe keep as is as there is some
+		  # do-what-I-mean column procesing here
+		  @H_FZ2_CLONE,
+		 );
+# core fz2 pattern file columns, other columns from earlier intermediate
+# files are not passed through.
+
 my @FUZZION_SRC_FILES;
 my @FUZZION_SOURCE_APPEND_FIELDS;
+
+my @SRC_FILES;
+my @PATTERN_FILES;
 
 use constant TAG_NO_CONTIG => "no_contig_given";
 use constant TAG_DEEP_INTRONIC => "deep_intronic";
@@ -294,6 +522,7 @@ use constant TAG_ADDED_GENE_ANNOTATION => "added_gene_annotation";
 use constant TAG_REPLACED_GENE_ANNOTATION => "replaced_gene_annotation";
 use constant TAG_UNRECOGNIZED_GENE_ANNOTATION => "unrecognized_gene_annotation";
 
+use constant TAG_ADDED_STRAND => "strand_added";
 use constant TAG_INCONSISTENT_STRAND_REPLACED => "inconsistent_gene_strand_replaced";
 use constant TAG_INCONSISTENT_STRAND_DETECTED => "inconsistent_gene_strand_detected";
 # detected a possible problem but left as-is; annotation might be legitimate,
@@ -387,12 +616,16 @@ my @clopts = (
 	      "-genomic",
 	      "-crest",
 	      "-cicero",
+	      "-no-chr-pos",
+	      "-annotate-genes-as-breakpoints",
 
 	      "-rna",
 	      "-full-gene-pair=s",
 	      "-full-gene-junctions=s",
 
-	      "-keep-gene-annotation",
+#	      "-keep-gene-annotation",
+	      "-rna-keep-gene-annotations=i" => \$RNA_KEEP_GENE_ANNOTATIONS,
+
 	      "-rna-suppress-intragenic=i" => \$RNA_SUPPRESS_INTRAGENIC,
 	      "-rna-ort-required=i" => \$RNA_ORT_REQUIRED,
 	      "-rna-intragenic-min-distance=i" => \$RNA_INTRAGENIC_MIN_DISTANCE_TO_PROCESS,
@@ -468,6 +701,7 @@ my @clopts = (
 	      "-extract-pattern-src=s",
 	      "-extract-patterns=s",
 	      "-src=s",
+	      "-substr",
 
 	      "-coding-distance-counts=s",
 
@@ -482,6 +716,15 @@ my @clopts = (
 	      "-gapextend=i" => \$BLAST_GAP_EXTEND,
 
 	      "-insertion2fuzzion=s",
+	      "-itd2fuzzion=s",
+	      # various intragenic events, not just ITDs
+	      "-del2fuzzion=s",
+	      # genomic deletion -> RNA pattern
+
+	      "-itd-max-query-gap=i" => \$ITD_MAX_QUERY_GAP,
+	      "-handle-large-dup-as-fusion=i" => \$ITD_LARGE_DUP_TREAT_AS_FUSION,
+	      "-itd-merge-pattern-output=i" => \$ITD_MERGE_PATTERN_OUTPUT,
+	      "-itd-min-query-align-fraction=f" => \$ITD_MIN_QUERY_ALIGN_FRACTION,
 	      "-gene=s",
 
 	      "-null-sample",
@@ -497,11 +740,75 @@ my @clopts = (
 	      "-generate-transcript-info",
 
 	      "-patch-breakpoints=s",
+
+	      "-soft-clip-to-pattern",
+	      "-sam=s",
+
+	      "-merge-patterns",
+	      "-f-patterns=s" => \@PATTERN_FILES,
+	      # fz2.tab pattern files
+	      "-f-src=s" => \@SRC_FILES,
+	      # source files for fz2.tab pattern files
+	      "-header-policy=s",
+	      # "core" or "first"
+	      "-patch=s",
+	      # optionally patch fields with given key,value pairs
+	      "-blank-undef",
+	      "-append-source",
+	      "-prepend-secondary",
+
+	      #
+	      # annotate exon info from fz2 hits file:
+	      #
+	      "-hit2exons=s",
+	      "-read=s",
+	      # filter to a specific read
+	      "-sort-by-span-score=i",
+
+	      "-itd-bracket-both-copies=i" => \$ITD_BRACKET_BOTH_COPIES,
+	      "-itd-bracket-one-copy-if-dup-minimum=i" => \$ITD_BRACKET_ONE_COPY_IF_DUP_MINIMUM,
+
+	      "-rc",
+
+	      "-repeat-expansion-fz2",
+	      # generate fuzzion2 patterns for regions flanking
+	      # a repeat expansion site
+	      "-repeat-expansion-ref",
+	      # generate an excerpt of a reference sequence reflecting
+	      # repeat expansion.  Used for custom mapping tests.
+	      # seems iffy: mapper may try too hard to align everything here
+	      "-repeat-expansion-whole",
+	      # copy the whole genome file, adjusting one chromosome
+	      # to reflect a repeat expansion.  Used for custom mapping tests.
+
+	      "-chr=s",
+	      "-start=i",
+	      "-end=i",
+	      "-repeat=s",
+	      "-count=i",
+	      "-count-list=s",
+	      "-flank=i",
+
+	      "-fusion-max-interstitial-length=i" => \$FUSION_MAX_INTERSTITIAL_LENGTH,
+	      "-fusion-prefer-best-contig-matches=i" => \$FUSION_PREFER_BEST_CONTIG_MATCHES,
+
+	      "-find-interstitial-coding",
+	      "-pattern=s",
+	      # optional filter
+
+	      "-patch-features",
+	      "-no-genbank-cache-check",
+	      "-fuzzy-codon=i",
+	      "-restrict-source=s",
+
+	      "-patch-gene-pair-summary",
+	      "-patch-gene-pair",
+
 	     );
 GetOptions(
 	   \%FLAGS,
 	   @clopts
-	  );
+	  ) || die "error parsing command-line options";
 
 if ($FLAGS{cicero}) {
   $F_CHR_A = 'chrA';
@@ -550,8 +857,12 @@ if ($FLAGS{"gencode2refflat"}) {
   isofox_convert();
   exit(0);
 } elsif ($FLAGS{"insertion2fuzzion"}) {
-  # treat contigs as containing insertion or ITD sequences
+  # treat contigs as containing insertion
   insertion2fuzzion();
+  exit(0);
+} elsif ($FLAGS{"itd2fuzzion"}) {
+  # treat contigs as containing ITD
+  itd2fuzzion();
   exit(0);
 } elsif ($FLAGS{"pattern-summary"}) {
   pattern_summary();
@@ -565,6 +876,38 @@ if ($FLAGS{"gencode2refflat"}) {
 } elsif ($FLAGS{"patch-breakpoints"}) {
   patch_breakpoints();
   exit(0);
+} elsif ($FLAGS{"soft-clip-to-pattern"}) {
+  soft_clip_to_pattern();
+  exit(0);
+} elsif ($FLAGS{"hit2exons"}) {
+  hit2exons();
+  exit(0);
+} elsif ($FLAGS{"merge-patterns"}) {
+  merge_pattern_files();
+  exit(0);
+} elsif ($FLAGS{"del2fuzzion"}) {
+  # genomic deletion -> fuzzion2 pattern
+  del2fuzzion();
+  exit(0);
+} elsif ($FLAGS{"repeat-expansion-fz2"}) {
+  # generate WGS patterns to target repeat expansion
+  repeat_expansion_fz2();
+  exit(0);
+} elsif ($FLAGS{"repeat-expansion-ref"}) {
+  repeat_expansion_ref();
+  exit(0);
+} elsif ($FLAGS{"repeat-expansion-whole"}) {
+  repeat_expansion_whole();
+  exit(0);
+} elsif ($FLAGS{"find-interstitial-coding"}) {
+  find_interstitial_coding();
+  exit(0);
+} elsif ($FLAGS{"patch-gene-pair-summary"}) {
+  patch_gene_pair_summary();
+  exit(0);
+} elsif ($FLAGS{"patch-gene-pair"}) {
+  patch_gene_pair();
+  exit(0);
 }
 
 
@@ -576,6 +919,10 @@ my @NEW_HEADERS = (
 		   qw(
 		       input_row_number
 		       input_row_md5
+
+		    ),
+		   $F_GENOME,
+		   qw(
 		       genea_symbol
 		       genea_acc
 		       genea_acc_preferred
@@ -589,9 +936,11 @@ my @NEW_HEADERS = (
 		       geneb_pos_adj
 		       geneb_coding_distance
 		       geneb_feature
-
-		       gene_pair_summary
-
+		    ),
+		   $F_GENE_PAIR_SUMMARY,
+		   $F_GENE_PAIR_SUMMARY_EXTENDED,
+		   $F_PROCESSING_TYPE,
+		   qw(
 		       genea_full
 		       geneb_full
 		       genea_contig_start
@@ -610,6 +959,14 @@ my @NEW_HEADERS = (
 # TO DO:
 # also include "sample" and other fields required by pattern conversion step?
 
+
+printf STDERR "configuration:\n";
+printf STDERR "  restricting to coding transcripts only?: %s\n", $CODING_ONLY ? "y" : "n";
+printf STDERR "  restricting to preferred isoforms only?: %s\n", $FLAGS{"restrict-nm-sjpi"} ? "y" : "n";
+
+#find_binary("blat", "-die" => 1);
+find_binary("blastn", "-die" => 1);
+# not needed for some functions below
 
 if (my $info = $FLAGS{"generate-test-file"}) {
   generate_test_file($info);
@@ -688,13 +1045,10 @@ if (my $info = $FLAGS{"generate-test-file"}) {
 } elsif ($FLAGS{"parse-cosmic"}) {
   parse_cosmic();
   exit(0);
+} elsif ($FLAGS{"patch-features"}) {
+  patch_features();
+  exit(0);
 }
-
-printf STDERR "configuration:\n";
-printf STDERR "  restricting to coding transcripts only?: %s\n", $CODING_ONLY ? "y" : "n";
-printf STDERR "  restricting to preferred isoforms only?: %s\n", $FLAGS{"restrict-nm-sjpi"} ? "y" : "n";
-
-find_binary("blastn", "-die" => 1);
 
 my $SJPI;
 if ($REPORT_SJPI or $FLAGS{"restrict-nm-sjpi"}) {
@@ -754,13 +1108,14 @@ while (my $row = $df->get_hash()) {
   # if mux.pl was used for parallelization row numbers won't be unique,
   # however MD5 should be.
   # - MD5 is of the raw input row, before any tweaks (e.g. gene annotation)
+  # TO DO: call populate_md5sum()
 
   my @gto_a;
   my @gto_b;
   if ($FLAGS{"no-chr"}) {
     @gto_a = @gto_b = ("-no-chr" => 1);
   } else {
-    my $chr_a = clean_chr($row->{$F_CHR_A} || die "no data for $F_CHR_A. Chromosomes are recommended due to mapping ambiguity for some genes, specify -no-chr if not available");
+    my $chr_a = clean_chr($row->{$F_CHR_A} || dump_die($row, "no data for $F_CHR_A. Chromosomes are recommended due to mapping ambiguity for some genes, specify -no-chr if not available"));
     my $chr_b = clean_chr($row->{$F_CHR_B} || die);
     # needed as hint for refFlat to find the correct record for gene
     # feature annotation, e.g. CRLF2 is mapped to both chr X and Y.
@@ -807,6 +1162,7 @@ while (my $row = $df->get_hash()) {
   unless ($can_process) {
     # processing not possible, skip
     my %r = %{$row};
+    $r{$F_GENOME} = standardize_genome($FLAGS{genome} || die "-genome");
     $r{input_row_number} = $input_row_number;
     $r{genea_acc} = "";
     $r{genea_acc_preferred} = "";
@@ -831,6 +1187,8 @@ while (my $row = $df->get_hash()) {
     $r{geneb_contig_start} = "";
     $r{geneb_contig_end} = "";
     $r{gene_pair_summary} = "";
+    $r{gene_pair_summary_extended} = "";
+    $r{$F_PROCESSING_TYPE} = "fusion_contig";
     $rpt->end_row(\%r);
     next;
   }
@@ -870,6 +1228,10 @@ while (my $row = $df->get_hash()) {
     my $contig_raw = $row->{$F_CONTIG} || dump_die($row, "no field $F_CONTIG");
     # put inside this loop because it may be expanded by large ITD detection,
     # and this process is specific to each isoform
+    my $qc = $contig_raw;
+    $qc =~ s/[ACGTN]//ig;
+    dump_die($row, "ERROR: contig contains non-ACGTN characters $qc") if $qc;
+    # sanity check
 
     my $cd_a = "";
     if ($pos_a_raw ne VALUE_NA and
@@ -971,7 +1333,7 @@ while (my $row = $df->get_hash()) {
 #	    printf STDERR "idx %d %s\n", $i, $s1;
 #	    printf STDERR "idx %d %s\n", $j, $s2;
 
-	    my $intersect = intersect $s1 $s2;
+ 	    my $intersect = intersect $s1 $s2;
 
 	    if ($intersect->size()) {
 	      # keep HSPs whose query ranges overlap
@@ -1791,6 +2153,18 @@ while (my $row = $df->get_hash()) {
   #  write final output rows for this input record:
   #
   foreach my $r (@out_rows) {
+    $r->{$F_GENOME} = standardize_genome($FLAGS{genome} || die "-genome");
+    $r->{genea_chr} = $r->{$F_CHR_A};
+    $r->{genea_pos} = $r->{$F_POS_A};
+    $r->{geneb_chr} = $r->{$F_CHR_B};
+    $r->{geneb_pos} = $r->{$F_POS_B};
+    # hack
+    $r->{$F_PROCESSING_TYPE} = "fusion_contig";
+
+    $r->{genea_acc_preferred} = get_sjpi($SJPI, $r->{genea_acc});
+    $r->{geneb_acc_preferred} = get_sjpi($SJPI, $r->{geneb_acc});
+    # TO DO: sharable sub call for this
+
     generate_pair_summary($r);
     $rpt->end_row($r);
   }
@@ -2440,6 +2814,7 @@ sub convert_fuzzion {
     die "where is $_" unless -s $_;
   }
 
+  my $cicero_mode = $FLAGS{cicero};
   my %blacklist;
   my %blacklist_removed;
   unless ($FLAGS{"no-blacklist"}) {
@@ -2466,22 +2841,8 @@ sub convert_fuzzion {
   my $REPORT_SAMPLE = 1;
   my $REPORT_SOURCE = 1;
 
-  die "4/2023: FIX: now must clone chr and pos too!!";
-  my @REPORT_CLONE_FIELDS = qw(
-				genea_symbol
-				genea_acc
-				genea_feature
-
-				geneb_symbol
-				geneb_acc
-				geneb_feature
-
-				gene_pair_summary
-				pathogenicity_somatic
-			     );
   # output is only a subset of the inputs, as these will be
   # in varying formats depending on origin and conversion method
-
   my $found_extra_source;
 
   foreach my $field (@fields) {
@@ -2496,16 +2857,10 @@ sub convert_fuzzion {
     my %pattern_seq;
     my %pattern_annot;
 
-    my @ph = qw(pattern sequence);
-    push @ph, "source" if $REPORT_SOURCE;
-    push @ph, $F_SAMPLE if $REPORT_SAMPLE;
-    # TO DO: check if field already exists
-    push @ph, @REPORT_CLONE_FIELDS;
-
     my $rpt_patterns = new Reporter(
 			 "-file" => $outfile,
 			 "-delimiter" => "\t",
-			 "-labels" => \@ph,
+			 "-labels" => \@H_FZ2_CORE,
 			 "-auto_qc" => 1,
 			);
 
@@ -2523,12 +2878,17 @@ sub convert_fuzzion {
 
     foreach my $infile (@infiles) {
       printf STDERR "  file: %s\n", $infile;
-      my $infile_tag = basename($infile);
-      $infile_tag =~ s/\..*//;
+      my $infile_tag = file_to_tag($infile);
 
       my $df = new DelimitedFile("-file" => $infile,
 				 "-headers" => 1,
 				);
+
+      my $rows_in = [];
+      while (my $row = $df->get_hash()) {
+	push @{$rows_in}, $row;
+      }
+      # FIX ME: this uses a lot of RAM.
 
       my $of_pattern = sprintf '%s.%s.pattern.tab', basename($infile), $field;
       my $rpt = $df->get_reporter(
@@ -2542,7 +2902,17 @@ sub convert_fuzzion {
       # Annotate intermediate file with final pattern IDs.
       # There is a separate file for each pattern length style being generated.
 
-      while (my $row = $df->get_hash()) {
+      if ($FUSION_PREFER_BEST_CONTIG_MATCHES) {
+	$rows_in = filter_by_contig_identity(
+					     "-rows" => $rows_in,
+					     "-df" => $df,
+					     "-rpt-suppressed" => $rpt
+					    );
+      }
+#      die scalar @{$rows_in};
+
+
+      foreach my $row (@{$rows_in}) {
 	dump_die($row, "new record", 1) if $VERBOSE;
 	dump_die($row, "ERROR: no field $field") unless exists $row->{$field};
 
@@ -2582,11 +2952,14 @@ sub convert_fuzzion {
 	      }
 	    }
 
-	    $pattern_annot{$pid}{source}{$tag} = 1;
+	    $pattern_annot{$pid}{$F_SOURCE}{$tag} = 1;
 	  }
 
-	  foreach my $f (@REPORT_CLONE_FIELDS) {
-	    my $v = $row->{$f} || "";
+	  cicero_clone_patch($row) if $cicero_mode;
+
+	  foreach my $f (@H_FZ2_CLONE) {
+	    dump_die($row, "can't clone input field $f; consider -cicero option?") unless exists $row->{$f};
+	    my $v = $row->{$f};
 	    if (length $v) {
 	      $pattern_annot{$pid}{$f}{$v} = 1;
 	    }
@@ -2639,50 +3012,11 @@ sub convert_fuzzion {
 	my $notes = $row->{$F_NOTES};
 	dump_die($row, "missing notes field") unless defined $notes;
 
-	my $itd_mode = $notes =~ /duplicate_blocks/;
 	my $intragenic_mode = $genea eq $geneb;
-
-#	my $brk_a = $itd_mode ? "}" : "]";
-#	my $brk_b = $itd_mode ? "{" : "[";
 	my $brk_a = $intragenic_mode ? "}" : "]";
 	my $brk_b = $intragenic_mode ? "{" : "[";
 	# for intragenic events always use {} brackets so that
 	# spanning the breakpoint is required
-
-	if (my $pid = $saw{$genea}{$geneb}{$contig_uc}) {
-	  # different combination of isoforms produces the same contig
-	  # we've processed already
-	  $duplicates_contig++;
-	  $row->{pattern} = $pid;
-	  &$track_annot($pid);
-	  $rpt->end_row($row);
-	  next;
-	} else {
-	  printf STDERR "temp %s\n", join ",", $genea, $geneb, $contig_uc;
-#	  $saw{$genea}{$geneb}{$contig_uc} = "temp_value_a_bug_if_you_see_this";
-	  # temporary: final ID will be filled in later
-#	  printf STDERR "debug %s %s %s\n", $genea, $geneb, $contig_uc;
-	}
-
-	if (my $old = $saw2{$contig_uc}) {
-	  # this can happen if two different gene pairs yield the same contig,
-	  # e.g. MZT2A-BTBD2 and MZT2B-BTBD2.
-	  # Much more likely to happen if we use transcript-pair-specific
-	  # gene symbols rather than the raw symbol, which may contain lists.
-	  printf STDERR "NOTE, duplicate contig:%s\n", join "\t",
-	    $genea, $old->{genea_symbol},
-	      $geneb, $old->{geneb_symbol},
-		$contig_uc, $old->{$field};
-	  my $pid = $saw2_pid{$contig_uc} || die "can't get old PID";
-	  # pattern ID may refer to a different gene pair...
-	  $duplicates_contig++;
-	  &$track_annot($pid);
-	  # ...however we won't lose any annotations
-	  $row->{pattern} = $pid;
-	  $rpt->end_row($row);
-	  next;
-	}
-	$saw2{$contig_uc} = $row;
 
 	my ($a_c_start,
 	    $a_c_end,
@@ -2707,18 +3041,21 @@ sub convert_fuzzion {
 	  next;
 	}
 
-	my $count = ++$counter{$genea}{$geneb};
-	my $contig_id = sprintf '%s-%s-%02d', $genea, $geneb, $count;
-	dump_die($row, "new contig $contig_id", 1) if $VERBOSE;
-	printf STDERR "assign %s\n", join ",", $genea, $geneb, $contig_uc;
-	$saw{$genea}{$geneb}{$contig_uc} = $contig_id;
-	$saw2_pid{$contig_uc} = $contig_id;
-
-	if ($VERBOSE) {
-	  printf STDERR "debug %s\n", join ",", $a_c_start, $a_c_end, $b_c_start, $b_c_end, $gap;
-	  printf STDERR "before: %s\n", $contig;
+	if ($FUSION_MAX_INTERSTITIAL_LENGTH and
+	    $gap > $FUSION_MAX_INTERSTITIAL_LENGTH) {
+	  # reduce overly-long interstitial region
+	  if ($FUSION_INTERSTITIAL_TRIM_POLICY eq "B") {
+	    # preserve B breakpoint site
+	    $a_c_end = $b_c_start - $FUSION_MAX_INTERSTITIAL_LENGTH - 1;
+	    $gap = $b_c_start - $a_c_end - 1;
+	  } else {
+	    die "unimplemented interstitial trim policy $FUSION_INTERSTITIAL_TRIM_POLICY";
+	  }
 	}
 
+	#
+	#  mark breakpoint site:
+	#
 	# mixed upper/lowercase sequence (w/contig UC) required
 	# for this operation:
 	if ($gap) {
@@ -2731,9 +3068,67 @@ sub convert_fuzzion {
 	  dump_die($row, "flush border", 1);
 	  $contig =~ s/^([a-z]+[A-Z]{$a_c_end})/$1${brk_a}${brk_b}/ || die "can't mark border at $a_c_end in $contig";
 	}
+	my $final = uc($contig);
+	# final pattern sequence with brackets
+
+	#
+	#  duplicate checking:
+	#
+	if (my $pid = $saw{$genea}{$geneb}{$final}) {
+	  # typically happens if a different combination of isoforms
+	  # for this gene pair produces the same pattern
+	  $duplicates_contig++;
+	  $row->{pattern} = $pid;
+	  &$track_annot($pid);
+	  $rpt->end_row($row);
+	  next;
+	}
+
+	if (my $old = $saw2{$final}) {
+	  # this can happen if two different gene pairs yield the same pattern,
+	  # e.g. MZT2A-BTBD2 and MZT2B-BTBD2.
+	  # Much more likely to happen if we use transcript-pair-specific
+	  # gene symbols rather than the raw symbol, which may contain lists.
+	  printf STDERR "NOTE, duplicate contig:%s\n", join "\t",
+	    $genea, $old->{genea_symbol},
+	      $geneb, $old->{geneb_symbol},
+	      $contig_uc, $old->{$field};
+	  my $pid = $saw2_pid{$final} || die "can't get old PID";
+	  # pattern ID may refer to a different gene pair...
+	  $duplicates_contig++;
+	  &$track_annot($pid);
+	  # ...however we won't lose any annotations
+	  $row->{pattern} = $pid;
+	  $rpt->end_row($row);
+#	  dump_die($row, "test me: after tracking change to full pattern");
+	  # should be OK, just check this
+	  next;
+	}
+	$saw2{$final} = $row;
+
+
+	#
+	#  assign new pattern ID:
+	#
+	my $count = ++$counter{$genea}{$geneb};
+	my $contig_id = sprintf '%s-%s-%02d', $genea, $geneb, $count;
+	dump_die($row, "new contig $contig_id", 1) if $VERBOSE;
+	printf STDERR "assign %s\n", join ",", $genea, $geneb, $contig_uc;
+
+	#
+	#  add to duplicate tracking:
+	#
+	#	$saw{$genea}{$geneb}{$contig_uc} = $contig_id;
+	$saw{$genea}{$geneb}{$final} = $contig_id;
+	$saw2_pid{$final} = $contig_id;
+
+	if ($VERBOSE) {
+	  printf STDERR "debug %s\n", join ",", $a_c_start, $a_c_end, $b_c_start, $b_c_end, $gap;
+	  printf STDERR "before: %s\n", $contig;
+	}
 
 	if (1) {
-	  $pattern_seq{$contig_id} = uc($contig);
+	  $pattern_seq{$contig_id} = $final;
 	  &$track_annot($contig_id);
 	} else {
 	  # original format: write pattern immediately
@@ -2774,7 +3169,7 @@ sub convert_fuzzion {
 	$r{$F_SAMPLE} = join ",", sort keys %{$pattern_annot{$pid}{$F_SAMPLE}};
       }
 
-      foreach my $f (@REPORT_CLONE_FIELDS) {
+      foreach my $f (@H_FZ2_CLONE) {
 	$r{$f} = join ",", sort keys %{$pattern_annot{$pid}{$f}};
       }
 
@@ -4046,6 +4441,8 @@ sub generate_genomic_contigs {
   }
 
   my $infile = $FLAGS{file} || die "-file";
+  my $genome = $FLAGS{genome} || die "-genome";
+
   my $df = new DelimitedFile(
 			     "-file" => $infile,
 			     "-headers" => 1,
@@ -4077,6 +4474,17 @@ sub generate_genomic_contigs {
   push @extra, $F_SAMPLE unless $h{$F_SAMPLE};
   # needed for fuzzion2 pattern generation
 
+  my @f_null_clone = qw(
+		genea_acc
+		genea_feature
+
+		geneb_acc
+		geneb_feature
+
+		gene_pair_summary
+		gene_pair_summary_extended
+		      );
+
   # TO DO: modify the below to use @NEW_HEADERS
   push @extra, (
 		"contig",
@@ -4094,6 +4502,9 @@ sub generate_genomic_contigs {
 		"extended_max",
 		# since this mode is not based on a gene model, just
 		# hardcode a larger number
+		$F_GENOME,
+		$F_PROCESSING_TYPE,
+		@f_null_clone,
 		$F_NOTES
 	       );
 
@@ -4141,6 +4552,16 @@ sub generate_genomic_contigs {
 		   "-ga" => $ga,
 		   "-row" => $row
 		  );
+
+    if ($FLAGS{"annotate-genes-as-breakpoints"}) {
+      # for source data that consists of breakpoints only,
+      # may be easier to review if the gene names are set to
+      # genomic breakpoint details.
+      $row->{$f_gene_a} = join "_", $chr_a, $pos_a, $ort_a;
+      $row->{$f_gene_b} = join "_", $chr_b, $pos_b, $ort_b;
+      # may need work as strand may interfere with pattern separator.
+      # maybe spell out "plus" and "minus"?
+    }
 
     #
     # get flanking sequences:
@@ -4227,6 +4648,12 @@ sub generate_genomic_contigs {
 
     $row->{$F_NOTES} = join ",", @notes;
     $row->{$F_SAMPLE} = "" unless $row->{$F_SAMPLE};
+    $row->{$F_GENOME} = standardize_genome($genome);
+    $row->{$F_PROCESSING_TYPE} = "genomic";
+
+    foreach my $f (@f_null_clone) {
+      $row->{$f} = "";
+    }
 
     $rpt->end_row($row);
 
@@ -4289,17 +4716,21 @@ sub generate_rna_contigs {
 			    );
   my $outfile = basename($infile) . ".extended.tab";
 
-  my $keep_gene_annotation = $FLAGS{"keep-gene-annotation"};
+#  my $keep_gene_annotation = $FLAGS{"keep-gene-annotation"};
 
   printf STDERR "  intragenic events suppressed: %s\n", $RNA_SUPPRESS_INTRAGENIC ? "y": "n";
   unless ($RNA_SUPPRESS_INTRAGENIC) {
     # only applies when events not suppressed completely
     printf STDERR "  for intragenic events, minimum breakpoint distance required to process: %d\n", $RNA_INTRAGENIC_MIN_DISTANCE_TO_PROCESS;
   }
+  printf STDERR "  add/update gene symbol/strand: %s\n", $RNA_ADD_GENE_ANNOTATIONS ? "y" : "n";
+  printf STDERR "    preserve existing info: %s\n", $RNA_ADD_GENE_ANNOTATIONS ? "y" : "n";
 
   field_preset_setup();
 
   die "chr/pos/ort fields not defined; suggest using -cicero, -crest, etc." unless ($F_CHR_A and $F_POS_A and $F_CHR_B and $F_POS_B);
+
+  my $genome = standardize_genome($FLAGS{genome} || die "-genome");
 
   my @dwim_check = (
 		    \$F_CHR_A,
@@ -4320,7 +4751,7 @@ sub generate_rna_contigs {
   if ($F_GENE_A and $F_GENE_B) {
     push @dwim_check, \$F_GENE_A, \$F_GENE_B;
   } else {
-    if ($keep_gene_annotation) {
+    if ($RNA_KEEP_GENE_ANNOTATIONS) {
       die "gene fields not defined";
     } else {
       # will be generating gene annotations, use placeholder field names
@@ -4349,9 +4780,9 @@ sub generate_rna_contigs {
 
   my $gsm = init_gsm($rf);
 
-  my $need_gene_annotation = $keep_gene_annotation ? $RNA_ADD_GENE_ANNOTATIONS : 1;
+#  my $need_gene_annotation = $keep_gene_annotation ? $RNA_ADD_GENE_ANNOTATIONS : 1;
   my $ga;
-  if ($need_gene_annotation) {
+  if ($RNA_ADD_GENE_ANNOTATIONS) {
       my $f_refflat = get_refflat(1);
       $ga = new GeneAnnotation(
 			       "-style" => "refgene_flatfile",
@@ -4374,22 +4805,15 @@ sub generate_rna_contigs {
   my $input_row_number = 0;
   my %suppressed;
   while (my $row = $df->get_hash()) {
-    $input_row_number++;
-    $row->{input_row_md5} = md5_hex(map {$row->{$_}} @{$df->headers_raw});
+    dump_die($row, "new row", 1) if $VERBOSE;
 
-    if (0) {
-      foreach my $f (qw(
-			genea_coding_distance
-			geneb_coding_distance
-		     )) {
-	# not applicable to this mode
-	$row->{$f} = "";
-      }
-    }
+    $input_row_number++;
+    my $input_row_md5 = md5_hex(map {$row->{$_}} @{$df->headers_raw});
 
     my @notes_general;
 
-    add_gene_annotation($row, $ga, $gsm, \@notes_general) if $need_gene_annotation;
+    add_gene_annotation($row, $ga, $gsm, \@notes_general)
+      if $RNA_ADD_GENE_ANNOTATIONS;
 
     my $chr_a = $row->{$F_CHR_A} || die;
     my $chr_b = $row->{$F_CHR_B} || die;
@@ -4416,20 +4840,29 @@ sub generate_rna_contigs {
 
     my $can_process = 1;
 
-    my ($gene_a_transcript2rf, $gene_b_transcript2rf);
     my %transcript2gene;
-    if ($gene_a and $gene_b) {
+
+    #
+    #  initialize transcripts for gene A (required):
+    #
+    my ($gene_a_transcript2rf, $gene_b_transcript2rf);
+
+    my $intergenic_b;
+
+    if ($gene_a) {
       $gene_a_transcript2rf = get_transcripts($rf, $gsm, $gene_a, \@notes_general, \%transcript2gene, "-chr" => $chr_a);
-      $gene_b_transcript2rf = get_transcripts($rf, $gsm, $gene_b, \@notes_general, \%transcript2gene, "-chr" => $chr_b);
-      # mapping of transcripts to refFlat record entries
-
       transcript_filter($gene_a_transcript2rf, $gene_a, $FLAGS{"restrict-nm-a"});
-      transcript_filter($gene_b_transcript2rf, $gene_b, $FLAGS{"restrict-nm-b"});
-
       unless (keys %{$gene_a_transcript2rf}) {
 	$can_process = 0;
 	log_error("missing_transcripts_A", \%suppressed, \@notes_general);
       }
+    }
+
+    if ($gene_a and $gene_b) {
+      $gene_b_transcript2rf = get_transcripts($rf, $gsm, $gene_b, \@notes_general, \%transcript2gene, "-chr" => $chr_b);
+      # mapping of transcripts to refFlat record entries
+
+      transcript_filter($gene_b_transcript2rf, $gene_b, $FLAGS{"restrict-nm-b"});
 
       unless (keys %{$gene_b_transcript2rf}) {
 	$can_process = 0;
@@ -4441,7 +4874,9 @@ sub generate_rna_contigs {
 	$can_process = 0;
 	log_error("blacklisted", \%suppressed, \@notes_general);
       }
-
+    } elsif ($gene_a and not($gene_b)) {
+      # geneB site is intergenic
+      $intergenic_b = 1;
     } else {
       $can_process = 0;
 
@@ -4488,12 +4923,16 @@ sub generate_rna_contigs {
       next;
     }
 
+    #
+    #  preprocess A accessions to remove unprocessable records:
+    #
+    my @acc_a_usable;
     foreach my $acc_a (sort keys %{$gene_a_transcript2rf}) {
       my $rf_a = $gene_a_transcript2rf->{$acc_a} || die;
 
       my @problem;
-
       unless (strand_consistency_check($rf_a, $ort_a)) {
+	# geneA strand is expected to be consistent with gene model
 	log_error("gene_A_transcript_antisense", \%suppressed, \@problem);
       }
 
@@ -4529,76 +4968,195 @@ sub generate_rna_contigs {
 	}
 	$rpt->end_row(\%r);
 	next;
+      } else {
+	push @acc_a_usable, $acc_a;
       }
+    }
+
+    if ($RNA_SUPPRESS_DISTANT_ISOFORMS) {
+      #
+      # optionally filter out distant isoforms for position A:
+      #
+      my @close;
+      my @distant;
+
+      foreach my $acc_a (@acc_a_usable) {
+	my $rf_a = $gene_a_transcript2rf->{$acc_a} || die;
+
+	my @problem;
+
+	my ($a_up, $pos_a) = $tf->get_upstream_downstream(
+							  "-row" => $rf_a,
+							  "-direction" => "upstream",
+							  "-pos" => $pos_a_raw,
+							  "-extended" => 1
+							 );
+	die unless $a_up;
+	# should have been detected previously
+
+	my $dist = abs($pos_a_raw - $pos_a);
+	if ($dist >= $RNA_DISTANT_THRESHOLD) {
+	  push @distant, $acc_a;
+	} else {
+	  push @close, $acc_a;
+	}
+      }
+
+      if (@close and @distant) {
+	printf STDERR "%d: suppress distant %s in favor of close %s\n",
+	  $pos_a_raw, join(",", @distant), join(",", @close);
+	@acc_a_usable = @close;
+      }
+    }
+
+    foreach my $acc_a (@acc_a_usable) {
+      my $rf_a = $gene_a_transcript2rf->{$acc_a} || die;
+
+      my @problem;
+
+      my ($a_up, $pos_a) = $tf->get_upstream_downstream(
+						     "-row" => $rf_a,
+						     "-direction" => "upstream",
+						     "-pos" => $pos_a_raw,
+						     "-extended" => 1
+						    );
+      die unless $a_up;
+      # should have been detected previously
 
       my $cd_a = set_coding_distance($row, "a", $pos_a_raw, $pos_a);
 
-      foreach my $acc_b (sort keys %{$gene_b_transcript2rf}) {
+      my @iterate;
+      if ($intergenic_b) {
+	# gene B is intergenic: use placeholder for accession
+	@iterate = "__intergenic__";
+      } else {
+	# gene B is in a gene model
+	@iterate = sort keys %{$gene_b_transcript2rf};
+      }
+
+      my @rows_b_ok;
+
+      foreach my $acc_b (@iterate) {
 	my @problem;
+	my @notes_b;
 
-	my $is_intragenic = ($transcript2gene{$acc_a} || die) eq ($transcript2gene{$acc_b} || die);
-	# now that we have accession pair, check again for intergenic
-	# (can happen if geneA/B are a list)
-	if ($is_intragenic) {
-	  next if $acc_a ne $acc_b;
-	  # in intragenic mode, work within each single transcript rather
-	  # than combinations
+	printf STDERR "B ref: %s\n", $intergenic_b ? "intergenic" : $acc_b;
 
-	  if ($RNA_SUPPRESS_INTRAGENIC) {
-	    # not allowed at all, safest route with the limited information
-	    # we have available
-	    log_error("intragenic_event_suppressed", \%suppressed, \@problem);
-	  } else {
-	    # allowed, but with a minimum distance requirement (hacky)
-	    my $bp_distance = abs($pos_a_raw - $pos_b_raw);
-	    if ($bp_distance >= $RNA_INTRAGENIC_MIN_DISTANCE_TO_PROCESS) {
-	      # OK: assume a deletion, e.g. exon skip
+	my ($rf_b, $b_down, $pos_b);
+
+	if ($intergenic_b) {
+	  #
+	  #  B site is intergenic, use genomic sequence.
+	  #
+	  $pos_b = $pos_b_raw;
+
+	  $b_down = $fai->get_flanking(
+				       "-direction" => "downstream",
+				       "-chr" => $chr_b,
+				       "-pos" => $pos_b,
+				       "-ort" => $ort_b,
+				       "-length" => $WGS_CONTIG_MAX_LEN
+				      );
+
+	} else {
+	  #
+	  #  B site in a gene model
+	  #
+	  my $is_intragenic = ($transcript2gene{$acc_a} || die) eq ($transcript2gene{$acc_b} || die);
+	  # now that we have accession pair, check again for intergenic
+	  # (can happen if geneA/B are a list)
+	  if ($is_intragenic) {
+	    next if $acc_a ne $acc_b;
+	    # in intragenic mode, work within each single transcript rather
+	    # than combinations
+
+	    if ($RNA_SUPPRESS_INTRAGENIC) {
+	      # not allowed at all, safest route with the limited information
+	      # we have available
+	      log_error("intragenic_event_suppressed", \%suppressed, \@problem);
 	    } else {
-	      log_error("intragenic_event_suppressed_distance", \%suppressed, \@problem);
+	      # allowed, but with a minimum distance requirement (hacky)
+	      my $bp_distance = abs($pos_a_raw - $pos_b_raw);
+	      if ($bp_distance >= $RNA_INTRAGENIC_MIN_DISTANCE_TO_PROCESS) {
+		# OK: assume a deletion, e.g. exon skip
+	      } else {
+		log_error("intragenic_event_suppressed_distance", \%suppressed, \@problem);
+	      }
 	    }
 	  }
-	}
 
+	  $rf_b = $gene_b_transcript2rf->{$acc_b} || die;
 
-	printf STDERR "B ref %s\n", $acc_b;
+	  if (strand_consistency_check($rf_b, $ort_b)) {
+	    #
+	    # fusion orientation annotation matches gene model
+	    #
+	    ($b_down, $pos_b) = $tf->get_upstream_downstream(
+							     "-row" => $rf_b,
+							     "-direction" => "downstream",
+							     "-pos" => $pos_b_raw,
+							     "-extended" => 1
+							    );
+	    # downstream sequence for geneB from this base to end of gene
 
-	my $rf_b = $gene_b_transcript2rf->{$acc_b} || die;
+	    if ($b_down) {
+	      my $distance = abs($pos_b_raw - $pos_b);
+	      # see "geneb_coding_distance" in output
+	      if ($distance > 6) {
+		# For deeply intronic sites we should simply use the
+		# genomic sequence on the specified strand.
+		#
+		# UNFINISHED
+		dump_die($row, "FIX ME: adjusted distance to exon is $distance, use genomic instead?", 1);
+	      }
+	    } else {
+	      push @problem, "B_position_outside_of_transcript";
+	    }
+	  } else {
+	    #
+	    #  fusion orientation does NOT match the gene model.
+	    #  Use flanking genomic sequence for the specified strand.
+	    #
+	    $pos_b = $pos_b_raw;
 
-	unless (strand_consistency_check($rf_b, $ort_b)) {
-	  log_error("gene_B_transcript_antisense", \%suppressed, \@problem);
-	}
-
-	my ($b_down, $pos_b) = $tf->get_upstream_downstream(
-						"-row" => $rf_b,
-						"-direction" => "downstream",
-						"-pos" => $pos_b_raw,
-						  "-extended" => 1
-					       );
-	# downstream sequence for geneB from this base to end of gene
-
-	unless ($b_down) {
-	  push @problem, "B_position_outside_of_transcript";
+	    $b_down = $fai->get_flanking(
+					 "-direction" => "downstream",
+					 "-chr" => $chr_b,
+					 "-pos" => $pos_b,
+					 "-ort" => $ort_b,
+					 "-length" => $WGS_CONTIG_MAX_LEN
+					);
+	    push @notes_b, "gene_B_transcript_strand_mismatch";
+	    # informational only, not an error
+	  }
 	}
 
 	my $generate_out_row = sub {
 	  # use closure to avoid highly repetitive code in exceptions below
 	  my %r = %{$row};
+	  foreach my $f (@NEW_HEADERS, "contig") {
+#	    $r{$f} = "" unless defined $r{$f};
+	    $r{$f} = "";
+	    # wipe all columns because $row can be written to
+	    # multiple times! should really not do that.
+	  }
+
 	  $r{input_row_number} = $input_row_number;
+	  $r{input_row_md5} = $input_row_md5;
 	  $r{genea_acc} = $acc_a;
 	  $r{genea_symbol} = $transcript2gene{$acc_a} || die;
-	  $r{genea_pos_adj} = $pos_a;
+	  $r{genea_pos} = $r{genea_pos_adj} = $pos_a;
 	  $r{genea_feature} = get_feature_tag($rf, $rf_a, $pos_a);
 	  $r{geneb_acc} = $acc_b;
 	  $r{geneb_symbol} = $transcript2gene{$acc_b} || die;
-	  $r{geneb_pos_adj} = $pos_b;
+	  $r{geneb_pos} = $r{geneb_pos_adj} = $pos_b;
 	  $r{geneb_feature} = get_feature_tag($rf, $rf_b, $pos_b);
 	  # these annotations are populatable from here down as A/B are set up
 	  # TO DO: maybe move this further up to share everywhere?
-	  $r{$F_NOTES} = join ",", @notes_general, @problem;
-	  foreach my $f (@NEW_HEADERS, "contig") {
-	    $r{$f} = "" unless defined $r{$f};
-	  }
-	  generate_pair_summary(\%r);
+	  $r{$F_NOTES} = join ",", @notes_general, @problem, @notes_b;
+	  $r{genea_chr} = $chr_a;
+	  $r{geneb_chr} = $chr_b;
+
 	  return \%r;
 	};
 
@@ -4672,24 +5230,74 @@ sub generate_rna_contigs {
 	$row->{genea_acc} = $acc_a;
 	$row->{genea_acc_preferred} = get_sjpi($SJPI, $acc_a);
 	$row->{genea_symbol} = $transcript2gene{$acc_a} || die;
-	$row->{genea_pos_adj} = $pos_a;
+	$row->{genea_pos} = $row->{genea_pos_adj} = $pos_a;
 	$row->{genea_feature} = get_feature_tag($rf, $rf_a, $pos_a);
+	$row->{genea_chr} = $chr_a;
 
-	$row->{geneb_acc} = $acc_b;
-	$row->{geneb_acc_preferred} = get_sjpi($SJPI, $acc_b);
-	$row->{geneb_symbol} = $transcript2gene{$acc_b} || die;
-	$row->{geneb_pos_adj} = $pos_b;
-	$row->{geneb_feature} = get_feature_tag($rf, $rf_b, $pos_b);
+	if ($intergenic_b) {
+	  $row->{geneb_symbol} = "intergenic";
+	  # maybe some kind of option here?
+	  # downstream conversion does require a string for each
+	  # side of the breakpoint.
+
+	  foreach my $f (qw(
+			     geneb_acc
+			     geneb_acc_preferred
+			     geneb_feature
+			  )) {
+	    $row->{$f} = "";
+	  }
+	} else {
+	  $row->{geneb_acc} = $acc_b;
+	  $row->{geneb_acc_preferred} = get_sjpi($SJPI, $acc_b);
+	  $row->{geneb_symbol} = $transcript2gene{$acc_b} || die;
+	  $row->{geneb_feature} = get_feature_tag($rf, $rf_b, $pos_b);
+	}
+	$row->{geneb_pos} = $row->{geneb_pos_adj} = $pos_b;
+	$row->{geneb_chr} = $chr_b;
 
 	$row->{input_row_number} = $input_row_number;
-	$row->{$F_NOTES} = join ",", @notes_general;
+	$row->{input_row_md5} = $input_row_md5;
+	$row->{$F_NOTES} = join ",", @notes_general, @notes_b;
+	$row->{$F_GENOME} = $genome;
 
 	generate_pair_summary($row);
 
-	$rpt->end_row($row);
+	$row->{$F_PROCESSING_TYPE} = "rna_genomic_coordinates";
 
+	my $r_copy = { %{$row} };
+
+	push @rows_b_ok, $r_copy;
+	# queue output as we may need to postprocess
+
+      }  # $acc_b
+
+
+      if (@rows_b_ok > 1 and $RNA_SUPPRESS_DISTANT_ISOFORMS) {
+	# check for distant isoforms for gnee B:
+	# if coordinates are close to exons for some isoforms
+	# but not others, only use the proximal ones
+	my @close;
+	my @distant;
+	foreach my $r (@rows_b_ok) {
+	  my $dist = $r->{geneb_coding_distance};
+	  if ($dist >= $RNA_DISTANT_THRESHOLD) {
+	    push @distant, $r;
+	  } else {
+	    push @close, $r;
+	  }
+	}
+	if (@close and @distant) {
+	  @rows_b_ok = @close;
+	}
       }
-    }
+
+      foreach my $r (@rows_b_ok) {
+	# write final set
+	$rpt->end_row($r);
+      }
+
+    }  # $acc_a
   }
   $rpt->finish();
 
@@ -4866,8 +5474,7 @@ sub annotate_sources {
   my %patterns;
   my %sources;
   foreach my $f_pattern (keys %f_patterns) {
-    my $source = $f_pattern;
-    $source =~ s/\..*// || die;
+    my $source = file_to_source($f_pattern);
     $sources{$source} = 1;
 
     my $fields = $f_patterns{$f_pattern};
@@ -5335,16 +5942,20 @@ sub condense_patterns {
 #      $pattern_blacklist{$id} = $bid;
 #    }
 
-    die "clash" if $id2row{$id};
+    die "FATAL ERROR: duplicate record for pattern ID $id" if $id2row{$id};
     $id2row{$id} = $row;
     my $pair_key;
 
     if ($id =~ /^([\w\-\.]+)\-\d+$/) {
       # v1 pattern IDs, sometimes confounded, e.g. FHAD1-TMEM51-AS1-01
       # - period match is for CAND1.11
+      #
      $pair_key = $1;
      my @genes = split /\-/, $pair_key;
+     # may fail, e.g. pattern ID KCNJ14-H1-0,
+     # "H1-0" is a valid gene symbol  :/
      die unless @genes >= 2;
+#     printf STDERR "pair:%s  find %s\n", $pair_key, join ",", @genes;
      if (my $hits = $glm->find(\@genes)) {
        die unless @{$hits} == 1;
        my $hit = $hits->[0];
@@ -5359,7 +5970,7 @@ sub condense_patterns {
 	 die "broken key" unless $by_pair{$pair_key};
        }
      } else {
-       printf STDERR "add glm set %s\n", join ",", @genes;
+#       printf STDERR "add glm set %s\n", join ",", @genes;
        $glm->add_set("-genes" => \@genes);
      }
     } else {
@@ -5593,6 +6204,9 @@ sub condense_patterns {
 	$seq =~ s/\W/N/g;
 	# revision: instead, mark with Ns: if the breakpoints are in the
 	# same place they'll match, otherwise will count against mismatches
+
+	# TO DO: use different characters for fusion breakpoints
+	# and ITD breakpoints, so they will count as mismatches?
 
 	printf FATMP ">%s\n%s\n", $id, $seq;
       }
@@ -5904,7 +6518,7 @@ sub self_blast {
       foreach my $hsp (@hsp_filtered) {
 	# each HSP may contain 0, 1 or 2 breakpoints.
 	# if there are multiple HSPs, there is no guarantee both
-	# breakpoint will appear in one of them.
+	# breakpoints will appear in one of them.
 	# See also rescue procedure below.
 	my @ni_q = get_n_indexes($hsp->query_string());
 	my @ni_h = get_n_indexes($hsp->hit_string());
@@ -5969,7 +6583,12 @@ sub self_blast {
       }
 
       if (scalar keys %hsp_found > 1) {
-	die "hey now valid breakpoint result incorporating multiple HSPs";
+	# plausible breakpoint evidence found, but involving multiple HSPs.
+	# This implies some significant difference between the sequences,
+	# possibly an alternative transcript sequence which doesn't
+	# align directly.  These should not be considered equivalent.
+	printf STDERR "plausible breakpoint match for %s => %s, but involving multiple HSPs, so disqualified\n", $q_pid, $h_pid;
+	next;
       }
 
       if ($bp_count_found == 2) {
@@ -5981,7 +6600,7 @@ sub self_blast {
 	  next;
 	}
       } elsif (0 and @hsp_filtered > 1) {
-	# exempt this situation from check because Ns somtimes are
+	# exempt this situation from check because Ns sometimes are
 	# exempted from HSP edges, e.g.  RUNX1-RUNX1T1-133
 	# vs. RUNX1-RUNX1T1-140.
 	#
@@ -7105,6 +7724,8 @@ sub condense_from_report {
 	} elsif ($pid eq "suppressed_by_blacklist") {
 	  # ignore
 	} else {
+	  # encountered unhandled ID, ???
+	  # unrelated file?
 	  die "no record of pattern $pid";
 	}
       }
@@ -7158,35 +7779,37 @@ sub transcriptome_annotate {
 
   my $df = new DelimitedFile("-file" => $f_patterns,
 			     "-headers" => 1,
-			     );
+			    );
+
+  my @ambig_headers = qw(
+			  ambig_A_dust
+			  ambig_A_blast
+			  ambig_A_blast_gene_count
+			  ambig_A_blast_genes
+			  ambig_A_blast_detail
+			  ambig_A_coverage
+			  ambig_A_notes
+
+			  ambig_B_dust
+			  ambig_B_blast
+			  ambig_B_blast_gene_count
+			  ambig_B_blast_genes
+			  ambig_B_blast_detail
+			  ambig_B_coverage
+			  ambig_B_notes
+
+			  ambig_any
+
+			  ambig_homologous_gene_pair
+			  ambig_warning
+		       );
+
+  my $h_needed = detect_needed_headers($df, \@ambig_headers);
+
   my $outfile = basename($f_patterns) . ".ambig.tab";
   my $rpt = $df->get_reporter(
 			      "-file" => $outfile,
-			      "-extra" => [
-					   qw(
-					       ambig_A_dust
-					       ambig_A_blast
-					       ambig_A_blast_gene_count
-					       ambig_A_blast_genes
-					       ambig_A_blast_detail
-					       ambig_A_coverage
-					       ambig_A_notes
-
-					       ambig_B_dust
-					       ambig_B_blast
-					       ambig_B_blast_gene_count
-					       ambig_B_blast_genes
-					       ambig_B_blast_detail
-					       ambig_B_coverage
-					       ambig_B_notes
-
-					       ambig_any
-
-					       ambig_homologous_gene_pair
-					       ambig_warning
-
-					    )
-					  ],
+			      "-extra" => $h_needed,
   			      "-auto_qc" => 1,
 			     );
 
@@ -7721,7 +8344,25 @@ sub generate_pair_summary {
   my ($r) = @_;
   my $summary_a = join "/", @{$r}{qw(genea_symbol genea_acc genea_feature)};
   my $summary_b = join "/", @{$r}{qw(geneb_symbol geneb_acc geneb_feature)};
-  $r->{gene_pair_summary} = join "-", $summary_a, $summary_b;
+  $r->{$F_GENE_PAIR_SUMMARY} = join "-", $summary_a, $summary_b;
+
+  my @check = $F_GENOME;
+  push @check, (
+		"genea_chr",
+		"genea_pos",
+		"geneb_chr",
+		"geneb_pos"
+	       ) unless $FLAGS{"no-chr-pos"};
+
+  foreach my $f (@check) {
+    dump_die($r, "no field $f") unless $r->{$f};
+  }
+
+  my $ext_a = join "/", @{$r}{qw(genea_symbol genea_acc genea_feature),
+				$F_GENOME, "genea_chr", "genea_pos"};
+  my $ext_b = join "/", @{$r}{qw(geneb_symbol geneb_acc geneb_feature),
+				$F_GENOME, "geneb_chr", "geneb_pos"};
+  $r->{$F_GENE_PAIR_SUMMARY_EXTENDED} = join "-", $ext_a, $ext_b;
 }
 
 sub extract_cicero {
@@ -8112,8 +8753,15 @@ sub extract_pattern_sources {
 
 sub extract_patterns {
   # extract pattern sequences for a pattern list
-  my $plist = read_simple_file($FLAGS{"extract-patterns"} || die);
+  my $thing = $FLAGS{"extract-patterns"} || die;
+  my $plist;
+  if (-s $thing) {
+    $plist = read_simple_file($FLAGS{"extract-patterns"} || die);
+  } else {
+    $plist = [ split /,/, $thing ];
+  }
   my %wanted = map {$_ => 1} @{$plist};
+  my $substr_mode = $FLAGS{substr};
   my %found;
 
   my $df = new DelimitedFile(
@@ -8121,27 +8769,50 @@ sub extract_patterns {
 			     # pattern file (e.g. merged)
 			     "-headers" => 1,
 			     );
+
   my $outfile = $FLAGS{out} || "patterns.tab";
 
-  my $rpt = new Reporter(
-			 "-file" => $outfile,
-			 "-delimiter" => "\t",
-			 "-labels" => [
-				       qw(
-					   pattern
-					   sequence
-					)
-				      ],
-			 "-auto_qc" => 1,
-			);
+  my $rpt;
+  if (1) {
+    # keep all columns
+    $rpt = $df->get_reporter(
+			      "-file" => $outfile,
+  			      "-auto_qc" => 1,
+			     );
+  } else {
+    # minimal
+    $rpt = new Reporter(
+			   "-file" => $outfile,
+			   "-delimiter" => "\t",
+			   "-labels" => [
+					 qw(
+					     pattern
+					     sequence
+					  )
+					],
+			   "-auto_qc" => 1,
+			  );
+  }
 
   while (my $row = $df->get_hash()) {
     dump_die($row, "no pattern field") unless exists $row->{pattern};
     my $pid = $row->{pattern} || next;
-    if ($wanted{$pid}) {
-      $rpt->end_row($row);
-      $found{$pid} = 1;
+    my $match;
+    if ($substr_mode) {
+      foreach my $p (keys %wanted) {
+	if (index($pid, $p) >= 0) {
+	  $match = 1;
+	  $found{$p} = 1;
+	  last;
+	}
+      }
+    } else {
+      if ($wanted{$pid}) {
+	$match = 1;
+	$found{$pid} = 1;
+      }
     }
+    $rpt->end_row($row) if $match;
   }
   $rpt->finish();
 
@@ -8155,7 +8826,7 @@ sub extract_patterns {
 sub add_gene_annotation {
   my ($row, $ga, $gsm, $notes_ref) = @_;
 
-  my $keep_existing = $FLAGS{"keep-gene-annotation"};
+#  my $keep_existing = $FLAGS{"keep-gene-annotation"};
 
   foreach my $end (qw(A B)) {
     my ($chr, $pos, $gene);
@@ -8176,23 +8847,26 @@ sub add_gene_annotation {
 
     $gene = $row->{$f_gene};
 
-    my $annotate;
-    if ($keep_existing) {
+    my $annotate_gene;
+    my $annotate_strand;
+    if ($RNA_KEEP_GENE_ANNOTATIONS) {
       if ($gene) {
 	# retain existing annotation...
 	if ($RNA_FIX_GENE_ANNOTATIONS) {
 	  # ...unless it doesn't appear to be valid
-	  $annotate = 2 unless $gsm->find($gene);
+	  $annotate_gene = 2 unless $gsm->find($gene);
 	}
       } else {
-	$annotate = 1;
+	$annotate_gene = 1;
       }
+      $annotate_strand = 1 unless $row->{$f_strand};
     } else {
-      $annotate = 1;
+      $annotate_gene = 1;
+      $annotate_strand = 1;
     }
 
 
-    if ($annotate) {
+    if ($annotate_gene or $annotate_strand) {
       $ga->find(
 		"-reference" => $chr,
 		"-start" => $pos,
@@ -8200,49 +8874,65 @@ sub add_gene_annotation {
 	       );
       my $genes = $ga->results_genes_genomic_order();
       if (@{$genes}) {
-	$row->{$f_gene} = join ",", @{$genes};
-	add_tag($notes_ref, TAG_ADDED_GENE_ANNOTATION, $end);
-	if ($annotate == 2) {
-	  add_tag($notes_ref, TAG_REPLACED_GENE_ANNOTATION, sprintf "%s>%s", $gene, join "/", @{$genes});
-	}
 
-	#
-	#  add/update strand orientation.
-	#
-#	dump_die($row, "before strand check $end", 1);
-	my $strand_old = $row->{$F_ORT_A} || "";
-	my $strand_new = $ga->results_strand() || "";
-	# some sites are ambiguous, e.g. chr1.23851720 hits both E2F2
-	# (-) and LOC101928163 (+).  In these cases, better to use a
-	# blank value and look it up on a gene-by-gene basis.
-
-	my $update_strand = 1;
-	# add/update by default
-
-	if ($strand_old and $strand_old ne $strand_new) {
-	  # inconsisent strand annotation.
+	if ($annotate_gene) {
 	  #
-	  # in ProteinPaint export, there is evidence some of the strand
-	  # values are bogus, e.g. ClinicalPilot SJOS001_M DLG2/GRM5,
-	  # raw CICERO file shows ort - but export shows strand + (???)
-	  # /clinical/cgs01/clingen/prod/tartan/index/data/ClinicalPilot/ClinicalPilot/SJOS001_M/TRANSCRIPTOME/cicero-post/SJOS001_M/final_fusions.counts
+	  #  add/update gene symbols
 	  #
-	  # OTOH, might be an intentional antisense annotation.
-	  if ($RNA_UPDATE_GENE_STRAND) {
-	    add_tag($notes_ref, TAG_INCONSISTENT_STRAND_REPLACED, $end);
-	  } else {
-	    # mark inconsistency but don't change.
-	    add_tag($notes_ref, TAG_INCONSISTENT_STRAND_DETECTED, $end);
-	    $update_strand = 0;
+	  $row->{$f_gene} = join ",", @{$genes};
+	  add_tag($notes_ref, TAG_ADDED_GENE_ANNOTATION, $end);
+	  if ($annotate_gene == 2) {
+	    add_tag($notes_ref, TAG_REPLACED_GENE_ANNOTATION, sprintf "%s>%s", $gene, join "/", @{$genes});
 	  }
 	}
 
-	$row->{$f_strand} = $strand_new if $update_strand;
-      } elsif ($annotate == 2) {
+	#
+	#  add/update strand
+	#
+	if ($annotate_strand) {
+	  my $strand_old = $row->{$f_strand} || "";
+	  my $strand_new = $ga->results_strand() || "";
+	  # some sites are ambiguous, e.g. chr1.23851720 hits both E2F2
+	  # (-) and LOC101928163 (+).  In these cases, better to use a
+	  # blank value and look it up on a gene-by-gene basis.
+
+	  my $update_strand = 1;
+	  # add/update by default
+
+	  my $tag;
+
+	  if ($strand_old and $strand_old ne $strand_new) {
+	    # inconsisent strand annotation.
+	    #
+	    # in ProteinPaint export, there is evidence some of the strand
+	    # values are bogus, e.g. ClinicalPilot SJOS001_M DLG2/GRM5,
+	    # raw CICERO file shows ort - but export shows strand + (???)
+	    # /clinical/cgs01/clingen/prod/tartan/index/data/ClinicalPilot/ClinicalPilot/SJOS001_M/TRANSCRIPTOME/cicero-post/SJOS001_M/final_fusions.counts
+	    #
+	    # OTOH, could be an intentional annotation.
+	    if ($RNA_UPDATE_GENE_STRAND) {
+	      $tag = TAG_INCONSISTENT_STRAND_REPLACED;
+	    } else {
+	      # mark inconsistency but don't change.
+	      $tag = TAG_INCONSISTENT_STRAND_DETECTED;
+	      $update_strand = 0;
+	    }
+	  } elsif (not($strand_old)) {
+	    $tag = TAG_ADDED_STRAND;
+	  }
+
+	  $row->{$f_strand} = $strand_new if $update_strand;
+	  add_tag($notes_ref, $tag, $end) if $tag;
+
+	}
+
+      } elsif ($annotate_gene == 2) {
 	add_tag($notes_ref, TAG_UNRECOGNIZED_GENE_ANNOTATION, $gene);
       }
     }
-  }
+
+  }  # $end
+
 }
 
 sub add_tag {
@@ -8539,17 +9229,21 @@ sub readthrough_annotate {
 
   my $df = new DelimitedFile("-file" => $f_fz2,
 			     "-headers" => 1,
-			     );
+			    );
+
   my $outfile = basename($f_fz2) . ".readthrough.tab";
+
+
+  my @h_new = qw(
+		  readthrough_fusion
+		  readthrough_fusion_info
+		  readthrough_interval
+	       );
+  my $h_needed = detect_needed_headers($df, \@h_new);
+
   my $rpt = $df->get_reporter(
 			      "-file" => $outfile,
-			      "-extra" => [
-					   qw(
-					       readthrough_fusion
-					       readthrough_fusion_info
-					       readthrough_interval
-					    )
-					  ],
+			      "-extra" => $h_needed,
   			      "-auto_qc" => 1,
 			     );
 
@@ -8557,6 +9251,8 @@ sub readthrough_annotate {
     my $pattern = $r->{pattern} || die;
     my $geneA_raw = pattern_gene($pattern, $r->{"genea_symbol"}) || die;
     my $geneB_raw = pattern_gene($pattern, $r->{"geneb_symbol"}) || die;
+    # ideally would extract from pattern name itself, however
+    # "-" characters may themselves be used in pattern gene names
 
     my $sequence = $r->{sequence} || die;
     $sequence =~ tr/[]{}//d;
@@ -8674,12 +9370,13 @@ sub pattern2pair {
 }
 
 sub insertion2fuzzion {
-  # generate fz2 patterns for contigs containing insertion or ITD
+  # generate fz2 patterns for contigs containing insertion
   #
   # inputs:
   #  - contig sequence containing insertion or ITD vs. reference
   #  - refSeq accession to use for comparison (STRICT matching required)
   # output: fz2 pattern file
+  die "TO DO: update code to work for insertions only, NOT ITD!";
   my $f_in = $FLAGS{insertion2fuzzion} || die;
   find_binary("blastn", "-die" => 1);
 
@@ -9065,21 +9762,65 @@ sub insertion2fuzzion {
 
   $rpt->finish();
   $rpt_failed->finish();
-
 }
 
 sub pattern_gene {
   # hack to filter a gene annotation list to names associated with
   # pattern.  example: for pattern ANKHD1-ARHGAP26-01 and gene
   # annotation ANKHD1,ANKHD1-EIF4EBP3, ANKHD1 should be used because
-  # this appears in the pattern name but ANKHD1-EIF4EBP3 doesn't
+  # this appears in the pattern name but ANKHD1-EIF4EBP3 doesn't.
+  #
+  # HOWEVER this can be stymied by disambiguity updates to gene
+  # symbols in pattern names  :/
   my ($pattern, $gene_raw) = @_;
   die unless $gene_raw;
 
   my $result = $gene_raw;
   if ($gene_raw =~ /,/) {
-    my @usable = grep {index($pattern, $_) != -1} split /,/, $gene_raw;
-    die "can't diambiguate $gene_raw in $pattern" unless @usable == 1;
+    my @genes = split /,/, $gene_raw;
+    my @usable = grep {index($pattern, $_) != -1} @genes;
+    if (@usable == 1) {
+      # just a single result found
+      $result = $usable[0];
+    } elsif (@usable > 1) {
+      # multiple possibilities, e.g.:
+      #
+      #  - gene list = C7orf55,C7orf55-LUC7L2
+      #  - pattern = C7orf55-LUC7L2-IQSEC1-01
+      #
+      # in this both genes are found in pattern name, however
+      # C7orf55-LUC7L2 is the correct one.
+      my @sorted = sort {length($b) <=> length($a)} @usable;
+      $result = $sorted[0];
+      # so, consider the longest match the correct one
+    } elsif (@usable == 0) {
+      # check to see if gene name in pattern has been updated
+      # from source gene name (i.e. for harmonization).
+      # example: SPMIP7-IKZF1-01, gene annotation is for C7orf72,
+      # an earlier symbol for SPMIP7
+      my $p = $pattern;
+      $p =~ s/\-\d+$//;
+      my @pg = split /\-/, $p;
+      # genes in pattern ID
+
+      my $gsm = new_gsm_lite();
+      foreach my $g (@pg) {
+	$gsm->add_gene("-gene" => $g);
+      }
+
+      my %usable;
+      foreach my $g (@genes) {
+	if (my $hit = $gsm->find($g)) {
+	  $usable{$hit} = 1;
+	  # use the gene symbol from the pattern name rather than
+	  # the gene annotation, as it may be more up to date
+	}
+      }
+      @usable = sort keys %usable;
+      confess "$gene_raw disambiguation failure" unless @usable == 1;
+    } else {
+      die "can't disambiguate $gene_raw in $pattern, usable=" . scalar @usable;
+    }
     $result = $usable[0];
   }
   return $result;
@@ -9245,13 +9986,13 @@ sub append_patterns {
   $df = new DelimitedFile("-file" => $f_new,
 			  "-headers" => 1,
 			 );
-  my $source = basename($f_new);
+  my $source = file_to_source($f_new);
   while (my $row = $df->get_hash()) {
     # copy old patterns first and track IDs
     my $pid = $row->{pattern};
     die "duplicate pattern $pid" if $saw{$pid};
     $saw{$pid} = 1;
-    $row->{$F_SOURCE} = basename($f_new);
+    $row->{$F_SOURCE} = $source;
 
     foreach my $h (@h_orig) {
       # add blanks to any additional columns.
@@ -9549,7 +10290,7 @@ sub split_pair {
 }
 
 sub generate_transcript_info {
-  # generate "gene_pair_summary" field for CIERO input
+  # generate "gene_pair_summary" field for CICERO input
   my ($row) = @_;
 
   my $gene_a = $row->{$F_GENE_A} || die;
@@ -9812,7 +10553,3541 @@ sub patch_breakpoints {
   }
 
   $rpt->finish();
+}
+
+sub soft_clip_to_pattern {
+  # generate fz2 pattern based on soft clipping in a SAM read
+  # TO DO:
+  #  - other entrypoint possibilities
+  #  - deal with strand: this example assumes both aligned and clipped are +
+  my $f_sam = $FLAGS{sam} || die "-sam";
+  open(IN, $f_sam) || die;
+  my $sam = <IN>;
+  chomp $sam;
+  my @f = split /\t/, $sam;
+  my ($chr, $pos, $cigar, $sequence) = @f[2,3,5,9];
+
+  my @cigars = $cigar =~ /(\d+\S)/g;
+
+  my $cigar_softclip = $cigars[0];
+  $cigar_softclip =~ /^(\d+)S$/ || die "first CIGAR entry in $cigar not softclip";
+  my $sc_length = $1;
+  # TO DO: also work with examples where soft-clip is at the end
+
+  my $cigar_match = $cigars[1];
+  $cigar_match =~ /^(\d+)[\=M]$/ || die "second CIGAR entry in $cigar not match";
+  my $match_length = $1;
+
+  my $regexp = sprintf '^(.{%d})(.{%d})', $sc_length, $match_length;
+  $sequence =~ /$regexp/ || die;
+  my ($upstream, $downstream) = ($1, $2);
+
+  printf STDERR "up raw: %s\n", $upstream;
+  printf STDERR "down raw: %s\n", $downstream;
+
+  $upstream = substr($upstream, - $PATTERN_CONDENSE_DUPLICATE_FLANKING_WINDOW_SIZE);
+  $downstream = substr($downstream, 0, $PATTERN_CONDENSE_DUPLICATE_FLANKING_WINDOW_SIZE);
+
+  printf STDERR "up trimmed: %s\n", $upstream;
+  printf STDERR "down trimmed: %s\n", $downstream;
+
+  die "build fz2 pattern here";
+}
+
+sub itd2fuzzion {
+  # generate fz2 patterns for contigs containing ITD vs. reference mRNA
+  #
+  # inputs:
+  #  - contig sequence containing ITD vs. reference
+  #  - refSeq accession to use for comparison (STRICT matching required)
+  # output: fz2 pattern file
+  my $f_in = $FLAGS{itd2fuzzion} || die;
+  find_binary("blastn", "-die" => 1);
+
+  my $f_gene = "gene";
+  my $f_refseq = "refseq";
+  my $f_contig = "contig";
+  # make configurable?
+  my $restrict_nm = $FLAGS{"restrict-nm-a"};
+
+  my $cicero_mode = $FLAGS{cicero};
+  # CICERO ITD call data, breakpoint genes are annotated, but
+  # reference accessions are not provided
+  my $no_chr_pos = $FLAGS{"no-chr-pos"};
+
+  my ($rf, $f_refflat);
+  if ($cicero_mode) {
+    $rf = get_refflat() || die;
+  }
+
+  printf STDERR "configuration:\n";
+  printf STDERR "  BLAST gap open/extend: %s/%s\n",
+    (defined $BLAST_GAP_OPEN ? $BLAST_GAP_OPEN : "[default]"),
+      (defined $BLAST_GAP_EXTEND ? $BLAST_GAP_EXTEND : "[default]");
+  printf STDERR "  treat large dup as fusion: %s\n", yes_no($ITD_LARGE_DUP_TREAT_AS_FUSION);
+  printf STDERR "  use 5' UTR in alignment? %s\n", yes_no($ITD_INCLUDE_UTR5_IN_MAPPING);
+  printf STDERR "  merge output rows by pattern?: %s", yes_no($ITD_MERGE_PATTERN_OUTPUT);
+  printf STDERR " (type %d)", $ITD_MERGE_PATTERN_OUTPUT if $ITD_MERGE_PATTERN_OUTPUT;
+  print STDERR "\n";
+
+  print STDERR "\n";
+
+  my $force_gene = $FLAGS{gene};
+  my $force_acc = $FLAGS{accession};
+  # these apply to entire file, so only appropriate for single-record
+  # or single-gene input
+
+  my @f_check = $f_contig;
+  push @f_check, $f_gene unless $force_gene or $cicero_mode;
+  push @f_check, $f_refseq unless $force_acc or $cicero_mode;
+
+  #
+  #  pass 1: identify referenced refSeqs
+  #
+  my @in_rows;
+  # load input into memory as it requires 2 passes, and in cicero
+  # mode some annotations will be generated and added
+
+  my $df = new DelimitedFile("-file" => $f_in,
+			     "-headers" => 1,
+			     );
+  my %needed_rf;
+  my %exceptions;
+
+  my $f_cicero_exception = "__cicero_exception___";
+  my $f_cicero_accessions = "__cicero_accessions__";
+  my $f_cicero_gene = "__cicero_gene__";
+
+  while (my $row = $df->get_hash()) {
+    push @in_rows, $row;
+    foreach my $f (@f_check) {
+      dump_die($row, "no data for field $f") unless $row->{$f};
+    }
+
+    if ($cicero_mode) {
+      my $geneA = get_gene($row, "A");
+      if (not($geneA) or $geneA eq VALUE_NA) {
+	$row->{$f_cicero_exception} = "geneA_not_valid";
+	next;
+      }
+
+      my $geneB = get_gene($row, "B");
+      if (not($geneB) or $geneB eq VALUE_NA) {
+	$row->{$f_cicero_exception} = "geneB_not_valid";
+	next;
+      }
+
+      if ($geneA eq $geneB) {
+	$row->{$f_cicero_gene} = $geneA;
+	my $acc = $FLAGS{accession};
+	my @accs;
+	if ($acc) {
+	  # manually-specified, e.g. EGFRvIII, UBTF
+	  @accs = $acc;
+	} else {
+	  if (my $hits = $rf->find_by_gene($geneA)) {
+	    @accs = grep {/^NM_/} map {$_->{name}} @{$hits};
+	    die "no usable accessions" unless @accs;
+	  } else {
+	    die "no refFlat matches for $geneA";
+	  }
+	}
+	$row->{$f_cicero_accessions} = \@accs;
+	foreach my $acc (@accs) {
+	  $needed_rf{$acc} = 1;
+	}
+      } else {
+	# row not usable, record exception for later
+	$row->{$f_cicero_exception} = "multiple_genes_cannot_evaluate_duplication";
+	next;
+      }
+    } else {
+      my $acc = $force_acc || $row->{$f_refseq} || die;
+      $needed_rf{$acc} = 1;
+      # ugh: complications if given accession is versioned!!
+    }
+  }
+
+  #
+  #  fetch GenBank records for needed refseqs:
+  #
+  my $gb_cache = new GenBankCache();
+  my $result_files = $gb_cache->get([sort keys %needed_rf]);
+
+  my %acc2cds;
+  my %acc2versioned;
+
+  foreach my $file (@{$result_files}) {
+    my $gbc = new GenBankCDS("-file" => $file);
+    my $info = $gbc->get_info();
+    my $cds;
+    if ($ITD_INCLUDE_UTR5_IN_MAPPING) {
+      # some duplications include an interstitial 5' UTR,
+      # e.g. test_query_identity_56.tab
+      $cds = $info->{mrna_cds_with_utr5} || die;
+    } else {
+      $cds = $info->{mrna_cds} || die;
+      die "this is not compatible with feature annotation!!";
+    }
+
+    my $acc_v = $info->{accession_versioned} || die;
+    my $acc_unv = $info->{accession} || die;
+    foreach my $acc ($acc_v, $acc_unv) {
+      # accession numbers in the input file (if provided),
+      # may or may not be versioned
+      $acc2cds{$acc} = $cds;
+      $acc2versioned{$acc} = $acc_v;
+    }
+  }
+
+  my $f_out = $FLAGS{out} || basename($f_in) . ".fz2.tab";
+#  (my $f_failed = $f_out) =~ s/\.fz2\.tab$/.fz2_failed.tab/ || die;
+  # can't assume suffix if -out is manually specified
+  my $f_failed = $f_out . ".failed.tab";
+  # so, just append
+
+  my @h_shared = (
+		  @H_FZ2_CORE,
+		  qw(
+		      blast_hit_count
+		      blast_hsp_count
+		      blast_query_coverage_fraction
+		   ),
+		  $F_ITD_FEATURES,
+		  qw(
+		      exception
+		   )
+		  # these fields specific to this pipeline
+		 );
+  # shared between main output and failure report
+
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => [
+				       @h_shared,
+				       "detected_repeat",
+				       $f_contig,
+#				       "gene_sequence"
+				       ]
+			);
+  # fz2 output
+  # TO DO: standard variable(s) for pattern file header fields?
+
+  my $f_sample = guess_sample_column($df);
+
+  #
+  #  pass 2: process
+  #
+  my $rpt_failed = $df->get_reporter("-file" => $f_failed,
+				     "-extra" => [
+						  @h_shared,
+						  "any_result_ok",
+						 ]
+				    );
+
+  my $genome = standardize_genome($FLAGS{genome} || die "-genome");
+
+  my $rc_mode = $FLAGS{rc};
+
+  my %pattern_counter;
+  foreach my $row_in (@in_rows) {
+    my $contig = $row_in->{$f_contig} || die;
+    printf STDERR "new row: %s\n", $contig;
+    $contig = reverse_complement($contig) if $rc_mode;
+
+    my $copy_row = sub {
+      my %r = %{$row_in};
+      # local copy of row for modifications and additions.  don't modify
+      # original row hashref because output is queued rather than written
+      # directly.  Also can't simple make the copy local to the row,
+      # because there will be a new output row for each isoform checked.
+      $r{blast_hit_count} = 0;
+      $r{blast_hsp_count} = 0;
+      $r{blast_query_coverage_fraction} = "";
+      $r{genea_symbol} = $r{geneb_symbol} = "";
+      $r{genea_acc} = $r{geneb_acc} = "";
+      $r{genea_feature} = $r{geneb_feature} = "";
+      # blank/null values for exceptions
+      if ($no_chr_pos) {
+	# not available in input
+	$r{genea_chr} = "";
+	$r{geneb_chr} = "";
+	$r{genea_pos} = "";
+	$r{geneb_pos} = "";
+      } elsif ($cicero_mode) {
+	$r{genea_chr} = $r{chrA} || die "no chrA";
+	$r{geneb_chr} = $r{chrB} || die "no chrB";
+	$r{genea_pos} = $r{posA} || die "no posA";
+	$r{geneb_pos} = $r{posB} || die "no posB";
+      } else {
+	die "chr/pos not yet implemented for non-cicero input; see also -no-chr-pos";
+      }
+
+      $r{$F_PATHOGENICITY_SOMATIC} = "" unless exists $r{$F_PATHOGENICITY_SOMATIC};
+      # only present in some input files
+
+      $r{$F_GENOME} = $genome;
+      $r{$F_SOURCE} = file_to_tag($f_in);
+      $r{$f_contig} = $contig;
+      $r{$F_SAMPLE} = $f_sample ? $r{$f_sample} : "";
+      # populatable annotations: ADD MORE
+
+      return \%r;
+    };
+
+    my @out_ok;
+    my @out_failed;
+    # all records for the input row, passed or failed
+
+    my @accs;
+    if ($cicero_mode) {
+      if (my $exception = $row_in->{$f_cicero_exception}) {
+	my $r = &$copy_row();
+	$r->{exception} = $exception;
+	$r->{$F_ITD_FEATURES} = "";
+	push @out_failed, $r;
+      } else {
+	my $accs = $row_in->{$f_cicero_accessions} || dump_die($row_in, "no field $f_cicero_accessions");
+	push @accs, @{$accs};
+      }
+    } else {
+      my $acc = $force_acc || $row_in->{$f_refseq} || die;
+      push @accs, $acc;
+    }
+
+    foreach my $acc (@accs) {
+
+      next if $restrict_nm and $acc ne $restrict_nm;
+      # typically debugging
+
+      my $r = &$copy_row();
+
+      unless ($acc =~ /\.\d+$/) {
+	$acc = $acc2versioned{$acc} || die "can't get version for $acc";
+      }
+
+      my $gbc = new GenBankCDS("-file" => $gb_cache->get($acc, "-single" => 1));
+
+      my $gene;
+      if ($force_gene) {
+	$gene = $force_gene;
+      } else {
+	my $f = $cicero_mode ? $f_cicero_gene : $f_gene;
+	$gene = $r->{$f} || dump_die($r, "no $f");
+      }
+
+      $r->{genea_symbol} = $r->{geneb_symbol} = $gene;
+      $r->{genea_acc} = $r->{geneb_acc} = $acc;
+      $r->{genea_feature} = $r->{geneb_feature} = "";
+
+#      dump_die($r, "new acc $acc", 1);
+
+      my $rs_seq = $acc2cds{$acc} || die "can't get cds for $acc";
+
+      my $blast = get_blast();
+#      die $blast->gapextend;
+      my $parser = $blast->blast(
+				 "-query" => {
+					      "contig" => $contig,
+					     },
+				 "-database" => {
+						 $acc => $rs_seq
+						}
+				);
+      my $result = $parser->next_result();
+      # one object per query sequence (only one query seq)
+
+      my @hits;
+      while (my $hit = $result->next_hit()) {
+	push @hits, $hit;
+      }
+      $r->{blast_hit_count} = scalar @hits;
+      $r->{blast_hsp_count} = 0;
+
+      unless (@hits) {
+	$r->{exception} = "no_BLAST_matches";
+	$r->{$F_ITD_FEATURES} = "";
+	push @out_failed, $r;
+	next;
+      }
+
+      dump_die($r, "no blast hits for contig") unless @hits;
+      die "not exactly one hit" unless @hits == 1;
+
+      #
+      #  gather raw HSPs and calculate query coverage percentage:
+      #
+      my @hsps_raw;
+      my @spans_q;
+      my @si_subject;
+      my @spans_s;
+      while (my $hsp = $hits[0]->next_hsp) {
+	push @hsps_raw, $hsp;
+      }
+      @hsps_raw = sort {$a->start("query") <=> $b->start("query")} @hsps_raw;
+      # sort HSPs by query start, so references below are
+      # consecutive
+      # TO DO:
+      # 1. sort by query END rather than start?
+      # 2. detect very large ITD, where right hsp hit position is
+      #    less than left hsp hit position
+
+      $r->{blast_hsp_count} = scalar @hsps_raw;
+
+      my $has_gaps;
+      # TO DO: maybe refine by methods that choose subset of HSPs?
+
+      foreach my $hsp (@hsps_raw) {
+	printf STDERR "    score:%s strand:%s q:%d-%d subj:%d-%d num_identical:%d frac_identical_query:%s query_span:%d ref_span:%d total_span=%d query_string=%s hit_string=%s\n",
+	  $hsp->score,
+	    $hsp->strand,
+	      $hsp->range("query"),
+		$hsp->range("hit"),
+		  $hsp->num_identical(),
+		    $hsp->frac_identical("query"),
+		      $hsp->length("query"),
+			$hsp->length("hit"),
+			  $hsp->length("total"),
+			    $hsp->query_string(),
+			      $hsp->hit_string() if $VERBOSE;
+	push @spans_q, sprintf "%d-%d", $hsp->range("query");
+	my $span_subject = sprintf "%d-%d", $hsp->range("subject");
+	push @spans_s, $span_subject;
+	push @si_subject, new Set::IntSpan($span_subject);
+
+	my $hi = new HSPIndexer("-hsp" => $hsp);
+	$has_gaps = 1 if $hi->get_gap_info("query");
+	$has_gaps = 1 if $hi->get_gap_info("subject");
+      }
+
+      my $si = new Set::IntSpan(@spans_q);
+      my $query_aligned_bases = size $si;
+      my $query_aligned_fraction = $query_aligned_bases / length($contig);
+      $r->{blast_query_coverage_fraction} = sprintf "%.3f", $query_aligned_fraction;
+      $r->{gene_sequence} = $rs_seq;
+
+      my @itd_features;
+
+      push @itd_features, "has_hsp_gaps" if $has_gaps;
+
+      if ($query_aligned_fraction < $ITD_MIN_QUERY_ALIGN_FRACTION) {
+	push @itd_features, "low_query_alignment_identity";
+	# just report this as a tag rather than rejecting,
+	# some cases may be salvagable anyway
+      }
+
+      my @sub_opts = (
+		      "-hsps" => \@hsps_raw,
+		      "-query-sequence" => $contig,
+		      "-reference-sequence" => $rs_seq,
+		      "-row" => $r,
+		      "-features" => \@itd_features,
+		      "-acc" => $acc,
+		      "-gbc" => $gbc,
+		     );
+
+      my $ok;
+
+      if (simple_itd_check(@sub_opts)) {
+	$ok = 1;
+      } elsif (large_duplication_check(@sub_opts)) {
+	# found implied large ITD, i.e. where HSPs are ordered by
+	# query position, but subject sequences are out of order
+	$ok = 1;
+      } elsif (pure_insertion_check(@sub_opts)) {
+	$ok = 1;
+      } elsif (pure_deletion_check(@sub_opts)) {
+	$ok = 1;
+      } elsif (complex_indel_check(@sub_opts)) {
+	$ok = 1;
+      } elsif (0 and subject_overlap_check(@sub_opts,
+				     "-spans-s" => \@spans_s,
+				     "-si-subject" => \@si_subject,
+				    )) {
+	# disabled, these cases should now all handled by better code above
+	die "TEST ME: subject overlap check found";
+	# other code and/or prerequisites may handle all these cases now
+	$ok = 1;
+      }
+
+      if (not($ok) and @hsps_raw == 1) {
+	#
+	#  report additional info if just one alignment.
+	#  Maybe something we missed?  A small ITD, or some kind
+	#  of indel not captured?:
+	#
+	my $hi = new HSPIndexer("-hsp" => $hsps_raw[0]);
+	push @itd_features, sprintf "query_gaps=%d",
+	  $hi->get_gap_info("query");
+	push @itd_features, sprintf "subject_gaps=%d",
+	  $hi->get_gap_info("subject");
+      }
+
+      $r->{$F_ITD_FEATURES} = join ",", @itd_features;
+      $r->{detected_repeat} = "" unless $r->{detected_repeat};
+
+      if ($ok) {
+	dump_die($r, "ERROR: no genea_feature") unless $r->{genea_feature};
+	dump_die($r, "ERROR: no geneb_feature") unless $r->{geneb_feature};
+	# QC to ensure populated by different methods
+
+	$r->{exception} = "";
+	$r->{$F_PATTERN_ID} = generate_pid($gene, \%pattern_counter);
+	push @out_ok, $r;
+
+	if ($ITD_LARGE_DUP_GENERATE_TWO_PATTERN_STYLES and
+	    $r->{$F_INTERNAL_ALT_PATTERN}) {
+	  # alternate output row with different pattern is present
+	  my $r_alt = $r->{$F_INTERNAL_ALT_PATTERN};
+	  $r_alt->{detected_repeat} = "" unless $r_alt->{detected_repeat};
+	  $r_alt->{exception} = "";
+	  $r_alt->{$F_PATTERN_ID} = generate_pid($gene, \%pattern_counter);
+	  push @out_ok, $r_alt;
+	}
+      } else {
+	$r->{exception} = "no_event_detected";
+	push @out_failed, $r;
+      }
+    } # accession
+
+    #
+    #  write results to either main or failed file.  for failures, set
+    #  flag indicating whether any results could be generated for the
+    #  input (e.g. another isoform)
+    #
+
+    if ($ITD_MERGE_PATTERN_OUTPUT) {
+      # bucket rows by pattern:
+      my %pattern2row;
+      foreach my $r (@out_ok) {
+	my $p = $r->{sequence} || die;
+	push @{$pattern2row{$p}}, $r;
+      }
+      my @out_new;
+
+      if ($ITD_MERGE_PATTERN_OUTPUT == 1) {
+	# merge annotation columns, however this will mangle
+	# paired information like accession/transcript/exon
+
+	my @f_merge = @h_shared;
+	# add more?
+
+	# merge annotations in each set:
+	foreach my $p (sort keys %pattern2row) {
+	  my $set = $pattern2row{$p};
+	  my %r = %{$set->[0]};
+
+	  foreach my $f (@f_merge) {
+	    $r{$f} = join ",", @{unique_ordered_list($set, "-key" => $f)};
+	    # condense annotations
+	  }
+	  push @out_new, \%r;
+	}
+
+      } elsif ($ITD_MERGE_PATTERN_OUTPUT == 2) {
+	# just keep one record per pattern sequence.
+	# crude, but preserves separation of transcript/exon annotations
+	foreach my $p (sort keys %pattern2row) {
+	  my $set = $pattern2row{$p};
+	  push @out_new, $set->[0];
+	}
+      } else {
+	die "must be 1 or 2";
+      }
+      @out_ok = @out_new;
+    }
+
+    foreach my $r (@out_ok) {
+      if (1) {
+	# strip "chr" prefixes if present, so if we happen to
+	# later merge patterns from sources where some use the prefix
+	# and some don't, we don't get output like "chr13,13"
+	foreach my $f (qw(genea_chr geneb_chr)) {
+	  die unless exists $r->{$f};
+	  $r->{$f} =~ s/^chr//i;
+	}
+      }
+      generate_pair_summary($r);
+      $rpt->end_row($r);
+    }
+
+    my $any_ok = @out_ok ? 1 : 0;
+    foreach my $r (@out_failed) {
+      generate_pair_summary($r);
+      $r->{$F_PROCESSING_TYPE} = "";
+      $r->{$F_PATTERN_ID} = "";
+      $r->{$F_PATTERN_SEQUENCE} = "";
+
+      $r->{any_result_ok} = $any_ok;
+      # to help distinguish expected failures, e.g. for incompatible
+      # isoforms, from other problems that prevent any result from
+      # being generated
+      $rpt_failed->end_row($r);
+    }
+
+  } # input row
 
 
+  $rpt->finish();
+  $rpt_failed->finish();
 
+}
+
+sub query_overlap_rescue {
+  my ($hi_left, $hi_right, $features, $gbc) = @_;
+  confess "need features" unless $features;
+  # gbc: may ultimately need left and right
+
+  my $needs_rescue;
+  my $rescue_type;
+  my @rescue_tags;
+
+  my ($l_q_start, $l_q_end) = $hi_left->range("query");
+  my $l_q_si = new Set::IntSpan(sprintf "%d-%d", $l_q_start, $l_q_end);
+  my ($r_q_start, $r_q_end) = $hi_right->range("query");
+  my $r_q_si = new Set::IntSpan(sprintf "%d-%d", $r_q_start, $r_q_end);
+
+  # query overlap length
+  my $intersect = intersect $l_q_si $r_q_si;
+  if ($intersect->size()) {
+    #
+    # query regions overlap, rescue needed
+    #
+    $needs_rescue = 1;
+
+    my ($qo_start, $qo_end) = si2range($intersect);
+    printf STDERR "query overlap: %d-%d\n", $qo_start, $qo_end;
+
+    my $olen = ($qo_end - $qo_start) + 1;
+    push @rescue_tags, sprintf "query_overlap_length=%d", $olen;
+
+    if ($l_q_end == $qo_end and
+	$r_q_start == $qo_start) {
+      # the contested region is at the end of the left query
+      # and the start of the right query.
+      #
+      # compare alignment quality between the two: if one is
+      # perfect and the other isn't, trim the imperfect one.
+      # Since the left and right HSPs represent the anchoring
+      # to the reference sequence, this will maximize the
+      # upstream/downstream perfect alignment.
+      my $id_left = $hi_left->get_query_range_identity_score($qo_start, $qo_end);
+      my $id_right = $hi_right->get_query_range_identity_score($qo_start, $qo_end);
+
+      if ($id_left == 1 and $id_right < 1) {
+	# left alignment perfect, right is not,
+	# trim right query alignment.
+	$hi_right->trim_query_region($qo_start, $qo_end);
+#	printf STDERR "right HSP after trim: qs=%d hs=%d\n", $hi_right->start("query"), $hi_right->start("subject");
+	$rescue_type = "left";
+      } elsif ($id_right == 1 and $id_left < 1) {
+	# right alignment perfect, left is not,
+	# trim left query alignment.
+	$hi_left->trim_query_region($qo_start, $qo_end);
+	# trim the rightmost side of the left alignment
+	$rescue_type = "right";
+      } elsif ($id_right == 1 and
+	       $id_left == 1) {
+	# both sides have perfect alignment
+	if ($gbc) {
+	  my $edge_trimmed = microhomology_feature_edge_check(
+							      $hi_left,
+							      $hi_right,
+							      $qo_start,
+							      $qo_end,
+							      $gbc);
+	  if ($edge_trimmed) {
+	    # microhomology can be resolved by using known exon boundaries
+	    $rescue_type = $edge_trimmed;
+	  }
+
+	}
+
+	# since all genes are normalized to + strand, preserve the
+	# left (upstream) alignment.  Any better handling?
+	unless ($rescue_type) {
+	  # unless microhomology
+	  $hi_right->trim_query_region($qo_start, $qo_end);
+	  if ($olen <= $ITD_AMBIGUITY_RESCUE_MAX_MICROHOMOLOGY_SIZE) {
+	    # small, perfect alignment on both sides: likely microhomology
+	    $rescue_type = "microhomology_left";
+	  } else {
+	    $rescue_type = "tie_left";
+	    # arbitary
+	  }
+	}
+      } else {
+	# neither alignment is clean in the overlap region.  in this case:
+	# - find the portion of the overlap that cleanly aligns
+	#   in the left HSP (no mismatches, gaps, etc.)
+	# - trim left HSP after this site
+	# - trim right HSP before this site
+
+	my $last_ok = $hi_left->get_last_clean_alignment_base($qo_start, $qo_end);
+	$hi_left->trim_query_region($last_ok + 1, $qo_end);
+	# trim left HSP after this site
+	$hi_right->trim_query_region($qo_start, $last_ok);
+	# trim right HSP up to and including this site
+
+	$rescue_type = "split";
+	push @{$features}, sprintf "query_overlap_split_cleanup_at_query=%d", $last_ok;
+
+#	hsp_debug($hi_left, $hi_right);
+      }
+    }
+
+    # is the contested region the end of the left hsp and the
+    # start of the right hsp?  If so, is one alignment perfect
+    # and the other imperfect?  If so, trim the imperfect one.
+  }
+
+  if ($needs_rescue) {
+    if ($rescue_type) {
+      push @rescue_tags, sprintf "query_overlap_rescue=%s", $rescue_type;
+    }
+  }
+  push @{$features}, @rescue_tags;
+
+  return $needs_rescue;
+}
+
+sub si2range {
+  my ($intersect) = @_;
+  my $rl = run_list $intersect;
+  my ($start, $end);
+  if ($rl =~ /^(\d+)\-(\d+)$/) {
+    $start = $1;
+    $end = $2;
+  } elsif ($rl =~ /^(\d+)/) {
+    $start = $end = $1;
+  } else {
+    die "intersection $rl is not a simple range";
+  }
+  return ($start, $end);
+}
+
+sub large_duplication_check {
+  #
+  #  handles cases where the subject alignment for the right HSP
+  #  starts before the left HSP (very large duplication), or overlaps it
+  #  (medium duplication where alignment is captured by the HSPs).
+  #
+  my (%options) = @_;
+  my $hsps = $options{"-hsps"} || die;
+  my $rs_seq = $options{"-reference-sequence"} || die;
+  my $query_seq = $options{"-query-sequence"} || die;
+  my $features = $options{"-features"} || die;
+  my $row = $options{"-row"} || die;
+  my $acc = $options{"-acc"} || die;
+  my $gbc = $options{"-gbc"} || die;
+
+#  my $gb_cache = new GenBankCache();
+#  my $gbc = new GenBankCDS("-file" => $gb_cache->get($acc, "-single" => 1));
+
+  my $i_last = scalar @{$hsps} - 1;
+  my @possible_i;
+
+  my $found_large_itd = 0;
+
+  for (my $i = 0; $i < $i_last; $i++) {
+    if ($hsps->[$i]->end("hit") > $hsps->[$i + 1]->start("hit")) {
+      # left HSP ends at a point in the subject sequence *after*
+      # the right HSP begins.  This implies a large repeat of an
+      # earlier part of the subject sequence.
+      push @possible_i, $i;
+    }
+  }
+
+  if (@possible_i) {
+    if (@possible_i == 1) {
+      # one candidate pair
+      my ($i) = @possible_i;
+      my $hi_left = new HSPIndexer("-hsp" => $hsps->[$i]);
+      my $hi_right = new HSPIndexer("-hsp" => $hsps->[$i + 1]);
+
+      query_overlap_rescue($hi_left, $hi_right, $features, $gbc);
+
+      # TO DO:
+      # additional trimming if large gaps still present?
+
+      my $q_gap = get_query_gap($hi_left, $hi_right);
+      push @{$features}, sprintf "query_gap=%d", $q_gap if $q_gap;
+
+      my $ok = 1;
+
+      if ($q_gap > $ITD_MAX_QUERY_GAP) {
+	# *might* be this type of event, but too much of a gap
+	# in the query sequence vs. the reference, which might
+	# indicate the contig is from a different isoform that
+	# is not compatible with the current one (i.e. including
+	# an exon that this isoform doesn't)
+	# set some kind of status flag in output anyway?
+	# maybe some isoforms would work and others not?
+	#
+	# OTOH, might also be a fragment of intronic sequence which
+	# won't align to *any* isoform.
+
+	unless ($ITD_LARGE_DUP_TREAT_AS_FUSION or
+		$ITD_LARGE_DUP_GENERATE_TWO_PATTERN_STYLES) {
+	  push @{$features}, sprintf "possible_large_dup_but_query_gap_too_long";
+	  # this isoform isn't a good match, but maybe another one is
+	  $ok = 0;
+	}
+      }
+
+      if ($ok) {
+	#
+	# any gap in query alignment at breakpoint is within tolerances,
+	# consider plausible large duplication
+	#
+	query_overlap_rescue($hi_left, $hi_right, $features, $gbc);
+
+	my $left_subject_end = $hi_left->end("subject");
+	# reference sequence from this point and upstream
+	my $right_subject_start;
+	# reference sequence from this point and downstream
+
+	my $q_i_start = $hi_left->end("query") + 1;
+	# interstitial start: base after left HSP query align ends.
+	# the first/reference copy of the repeat should end before
+	# this position.
+	#
+	# TO DO: alternate behavior if we want to place BOTH copies
+	# of the ITD sequence within the brackets.  This may be
+	# the preferred behavior to avoid false-positive "strong"
+	# matches based on an overlap with a single copy only.
+
+	my $q_i_end;
+	# interstitial end
+	# both base numbers, not indices
+
+	my $implied_itd_size = -1;
+
+	# does the left HSP's subject end site appear within the right HSP?
+	# If so the ITD is captured within the alignment and should
+	# be reflected in the pattern (see test_ITD_66_nt.tab):
+	my $left_subj_start = $hi_left->start("subject");
+#	my $left_subj_end = $hi_left->end("subject");
+	my $right_subj_start = $hi_right->start("subject");
+	my $right_subj_end = $hi_right->end("subject");
+	my $is_large_dup;
+
+	itd_feature_annotate($row, $gbc, $hi_left, $hi_right);
+	# annotate breakpoints
+
+	printf STDERR "trimmed:\n";
+	printf STDERR "   left: q=%d-%d h=%d-%d\n",
+	  $hi_left->start("query"), $hi_left->end("query"),
+	    $hi_left->start("subject"), $hi_left->end("subject");
+	printf STDERR "  right: q=%d-%d h=%d-%d\n",
+	  $hi_right->start("query"), $hi_right->end("query"),
+	    $hi_right->start("subject"), $hi_right->end("subject");
+
+
+	my $allow_fusion_pattern;
+	my $copies_wanted = $ITD_BRACKET_BOTH_COPIES ? 2 : 1;
+	# how many copies of the dup sequence should be placed
+	# within the pattern brackets.  Two safer than just one.
+	#
+	# TO DO: may need reset/adjustment later for long duplications,
+	# as it may not be reasonable to require both copies
+	my $blast_rescue_mode;
+
+	my $da = new DuplicationAlignment(
+					  "-hi_left" => $hi_left,
+					  "-hi_right" => $hi_right,
+					  "-subject_sequence" => $rs_seq,
+					  "-bracket_copy_count" => $copies_wanted
+					 );
+	if ($da->has_duplication()) {
+	  #
+	  # duplicate is represented in HSP pair via subject overlap
+	  #
+
+	  # examples:
+	  # (A) subject region of HSP fully contained within subject region
+	  #  of left HSP:
+	  #   test_medium_dup_right_hsp_subset_of_left.tab
+	  #  /research/rgs01/home/clusterHome/medmonso/work/steve/2020_06_13_cicero_contig_extension/2021_01_04_all/blast/ITD_refactor/debug_PIK3R1/test.tab
+	  #
+	  # (B) first copy of repeat ends within second HSP (partial overlap)
+	  # example: test_medium_dup_partial_overlap.tab
+
+	  my $dup_sequence = $da->dup_sequence();
+	  $row->{detected_repeat} = $dup_sequence;
+	  $implied_itd_size = length $dup_sequence;
+
+	  if ($copies_wanted == 2 and
+	      $ITD_BRACKET_ONE_COPY_IF_DUP_MINIMUM and
+	      $implied_itd_size >= $ITD_BRACKET_ONE_COPY_IF_DUP_MINIMUM) {
+
+	    printf STDERR "before: q=%d-%d subj=%d-%d\n",
+	      $da->query_bracket_start_base(),
+	      $da->query_bracket_end_base(),
+	      $da->subject_upstream_base(),
+	      $da->subject_downstream_base();
+
+	    $copies_wanted = 1;
+
+	    $da = new DuplicationAlignment(
+					   "-hi_left" => $hi_left,
+					   "-hi_right" => $hi_right,
+					   "-subject_sequence" => $rs_seq,
+					   "-bracket_copy_count" => $copies_wanted,
+					  );
+	    # recalculate
+
+	    printf STDERR "after: q=%d-%d subj=%d-%d\n",
+	      $da->query_bracket_start_base(),
+	      $da->query_bracket_end_base(),
+	      $da->subject_upstream_base(),
+	      $da->subject_downstream_base();
+
+
+	    my $interstitial_len = ($da->query_bracket_end_base() - $da->query_bracket_start_base()) + 1;
+
+	    if ($ITD_BRACKET_ONE_COPY_RESCUE and
+		$interstitial_len >= $ITD_BRACKET_ONE_COPY_RESCUE_MINIMUM) {
+	      # additional rescue to help with patterns where
+	      # interstitial sequence is too long for short-read sequencing
+	      $da->blast_rescue();
+	      $blast_rescue_mode = 1;
+	    }
+	  }
+
+	  $q_i_start = $da->query_bracket_start_base();
+	  $q_i_end = $da->query_bracket_end_base();
+	  # bracketed bases in query sequence
+
+	  $left_subject_end = $da->subject_upstream_base();
+	  $right_subject_start = $da->subject_downstream_base();
+	  # upstream and downstream reference sequence
+
+	  my $ptype = "medium_subject_dup_bracket_";
+	  if ($copies_wanted == 1) {
+	    $ptype .= "1_copy";
+	    $ptype .= "_blast_rescue" if $blast_rescue_mode;
+	  } elsif ($copies_wanted == 2) {
+	    $ptype .= "2_copies";
+	  } else {
+	    die;
+	  }
+	  $row->{$F_PROCESSING_TYPE} = $ptype;
+
+	  $allow_fusion_pattern = 0;
+	  # if we allow this, resulting patterns are quite vulnerable
+	  # to false positives especially for "strong-" type read
+	  # pairs which don't overlap the site, so you're essentially
+	  # just reporting matches to canonical sequence
+	  #
+	  # TO DO: need some kind of rescue here for long dup sequences.
+	  # if we insist on both copies this may be too long for the
+	  # pattern to work in short-read data.
+	} else {
+	  #
+	  #  large duplication not completely captured in the
+	  #  alignment.  In this situation a secondary, fusion-style
+	  #  pattern may also be useful (e.g. for a large duplication
+	  #  where a much earlier exon repeats)
+	  #
+	  $is_large_dup = 1;
+	  $row->{$F_PROCESSING_TYPE} = "large_dup";
+	  $right_subject_start = $hi_right->start("subject");
+	  # here the right alignment represents the start of
+	  # the duplicated sequence
+	  $q_i_end = $hi_right->start("query") - 1;
+	  # base number before start of repeat alignment.
+	  # for large ITDs we won't attempt to contain the entire
+	  # interstitial sequence within the pattern, because
+	  # it can easily be longer than most short reads are
+	  # able to capture.
+	  $implied_itd_size = $left_subject_end - $right_subject_start;
+	  $allow_fusion_pattern = 1;
+	}
+
+	die "allow_fusion_pattern not defined" unless defined $allow_fusion_pattern;
+
+	my $ref_up = substr($rs_seq, 0, $left_subject_end);
+	# reference sequence from start to end of left HSP
+
+	my $ref_down = substr($rs_seq, $right_subject_start - 1);
+	# reference sequence from start of right HSP to end
+
+	trim_flanking(\$ref_up, \$ref_down);
+
+	unless ($ref_up) {
+	  # no upstream sequence in final pattern, e.g.
+	  # SJHM031438_D1 / IKZF1 / NM_001291840.1
+	  # this is not a legal fz2 format, so don't process.
+	  foreach my $f ($F_PROCESSING_TYPE, "detected_repeat") {
+	    delete $row->{$f};
+	  }
+	  push @{$features}, "error_no_upstream_sequence";
+	  # can't generate a legal fz2 pattern because no upstream
+	  # sequence available (may be just for a particular isoform)
+	  return 0;
+	}
+
+	my $interstitial = "";
+	# actually the *bracketed* sequence:
+	# - if a medium dup, one or two copies of the duplicated sequence
+	#   (depending on policy) plus any interstitial sequence
+	# - if a large dup, the truly interstitial/unmappable sequence
+	if ($q_i_start <= $q_i_end) {
+	  $interstitial = substr($query_seq,
+				 $q_i_start - 1,
+				 ($q_i_end - $q_i_start) + 1);
+	}
+
+	my $fz2_pattern_fusion = sprintf '%s%s%s%s',
+	  $ref_up, BREAKPOINT_FUSION_LEFT,
+	      BREAKPOINT_FUSION_RIGHT, $ref_down;
+	# fusion-style breakpoint, ignoring any interstitial sequence
+
+	my $fz2_pattern_itd = sprintf '%s%s%s%s%s',
+	  $ref_up, BREAKPOINT_ITD_LEFT,
+	    $interstitial,
+	      BREAKPOINT_ITD_RIGHT, $ref_down;
+	# ITD-style breakpoint, retaining any interstitial sequence
+
+	push @{$features}, sprintf "implied_itd_length=%d", $implied_itd_size;
+
+	if ($ITD_LARGE_DUP_GENERATE_TWO_PATTERN_STYLES) {
+	  my $ptype = $row->{$F_PROCESSING_TYPE} || die;
+	  $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern_itd;
+	  $row->{$F_PROCESSING_TYPE} .= "_ITD_style";
+	  # for primary result, use ITD-style pattern
+
+	  if ($allow_fusion_pattern and
+	      (length($interstitial) >= $ITD_MIN_INTERSTITIAL_FOR_ALTERNATE_PATTERN)
+	     ) {
+	    my $dubious_junction = dubious_junction_check($gbc, $rs_seq, $ref_up, $ref_down);
+	    # only calculate this when needed as it may cause problems
+	    # for smaller ITDs, where this scenario doesn't apply anyway
+	    if (not($dubious_junction)) {
+	      # all QC passed.
+	      # create alternate output row using a supplemental,
+	      # fusion-style pattern.  Only do this when there is true
+	      # interstitial sequence: for these cases an ITD-style
+	      # pattern will match the source sample, yet that sequence
+	      # may also prevent matching for similar-but-not-identical
+	      # events in other samples.  A minimum interstitial
+	      # sequence length is required, if the interstitial
+	      # sequence is very short we should use an ITD-style
+	      # pattern only.
+	      my %alt = %{$row};
+	      $alt{$F_PATTERN_SEQUENCE} = $fz2_pattern_fusion;
+	      my @feat = @{$features};
+	      push @feat, sprintf "ignored_interstitial=%s", $interstitial if $interstitial;
+	      $alt{$F_ITD_FEATURES} = join ",", @feat;
+	      $alt{$F_PROCESSING_TYPE} = $ptype . "_fusion_style";
+
+	      $row->{$F_INTERNAL_ALT_PATTERN} = \%alt;
+	    }
+	  }
+
+	} elsif ($ITD_LARGE_DUP_TREAT_AS_FUSION) {
+	  # just a fusion-style pattern
+	  die "unhandled" unless $allow_fusion_pattern;
+	  $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern_fusion;
+	  push @{$features}, sprintf "ignored_interstitial=%s", $interstitial if $interstitial;
+	} else {
+	  # just an ITD-style pattern
+	  $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern_itd;
+	}
+
+	$found_large_itd = 1;
+      }
+    } else {
+      push @{$features}, "multiple_candidates_for_large_dup";
+      # maybe later?
+    }
+  }
+
+  return $found_large_itd;
+}
+
+sub get_query_gap {
+  my ($hi_left, $hi_right) = @_;
+  # HSP or HSPIndexer
+  my $left_q_end = $hi_left->end("query");
+  my $right_q_start = $hi_right->start("query");
+  return ($right_q_start - $left_q_end) - 1;
+}
+
+sub trim_flanking {
+  my ($upstream, $downstream) = @_;
+#  printf STDERR "up before: %s\ndown before: %s\n", $$upstream, $$downstream;
+  if (1) {
+    $$upstream = substr($$upstream, - $EXTENDED_CHUNK_LENGTH);
+    $$downstream = substr($$downstream, 0, $EXTENDED_CHUNK_LENGTH);
+  }
+#  printf STDERR "up after: %s\ndown after: %s\n", $$upstream, $$downstream;
+}
+
+sub generate_pid {
+  my ($gene, $pattern_counter) = @_;
+  return sprintf '%s-%s-%02d', $gene, $gene, ++$pattern_counter->{$gene};
+}
+
+sub simple_itd_check {
+  # check for a simple ITD which appears within a single HSP
+  # as a deletion from the reference
+  my (%options) = @_;
+  my $hsps = $options{"-hsps"} || die;
+  my $rs_seq = $options{"-reference-sequence"} || die;
+  my $query_seq = $options{"-query-sequence"} || die;
+  my $features = $options{"-features"} || die;
+  my $row = $options{"-row"} || die;
+
+  #
+  #  look for candidate HSPs:
+  #
+  my @candidate_hi;
+  foreach my $hsp (@{$hsps}) {
+    my $hi = new HSPIndexer(
+			    "-hsp" => $hsp,
+			    "-min_gap_length" => $ITD_MIN_SIZE
+			   );
+    push @candidate_hi, $hi if @{$hi->hit_gaps()};
+  }
+
+  my $found_simple_itd;
+
+  if (@candidate_hi) {
+    if (@candidate_hi == 1) {
+      my $hi = $candidate_hi[0];
+      my $gaps = $hi->hit_gaps();
+      die "not exactly one gap" unless @{$gaps} == 1;
+      my $gap = $gaps->[0];
+
+      my $gbc = $options{"-gbc"} || die;
+
+      my $gb_up = $gap->{upstream_hit_base} || die;
+      my $gb_down = $gap->{downstream_hit_base} || die;
+
+      $row->{genea_feature} = $gbc->get_feature_for_base_number($gb_up);
+      $row->{geneb_feature} = $gbc->get_feature_for_base_number($gb_down);
+
+      my $ref_up = substr($rs_seq, 0, $gb_up);
+      my $ref_down = substr($rs_seq, $gb_down - 1);
+      my $interstitial = substr(
+			       $query_seq,
+			       $gap->{query_start} - 1,
+			       $gap->{gap_length}
+			       );
+
+      my $found_repeat;
+      if ($ITD_BRACKET_BOTH_COPIES) {
+	# original approach was simply to put brackets around the
+	# inserted sequence, which is too prone to false positives,
+	# especially if the flanking sequence is similar.  Really need to
+	# have BOTH copies of the dup within the pattern brackets.
+	my $has_up = $ref_up =~ /${interstitial}$/i;
+	my $has_down = $ref_down =~ /^${interstitial}/i;
+	if ($has_up and $has_down) {
+	  die "test me: both up and downstream copies";
+	} elsif ($has_up) {
+	  die "implement me: upstream copy";
+	} elsif ($has_down) {
+	  $ref_down =~ s/^${interstitial}//i || die "can't trim";
+	  $row->{detected_repeat} = $interstitial;
+	  $interstitial .= $interstitial;
+	  $found_repeat = 1;
+	} else {
+	  # no perfect neighboring copy
+	  my $identical_down = check_identical_down($interstitial, $ref_down);
+
+	  # TO DO:
+	  # implement upstream check, when we come across a good example
+
+	  printf STDERR "identical down: %d\n", $identical_down;
+
+	  if ($identical_down >= $ITD_RESCUE_MIN_SIZE) {
+	    # expand the interstitial sequence to include the
+	    # repeated bases.  Assume any additional bases are
+	    # truly interstitial as part of the insertion/dup event.
+	    $ref_down =~ s/^(.{$identical_down})// || die;
+	    $interstitial .= $1;
+	    # move the additional repeated bases from the downstream
+	    # sequence into the interstitial sequence
+	    push @{$features}, sprintf "rescue_itd_site_downstream=%d", $identical_down;
+	    $found_repeat = 1;
+	  } else {
+	    printf STDERR "WARNING: no second copy detected for interstitial sequence $interstitial\n";
+	    # - if event is a simple insertion, this outcome is OK.
+	    # - however if there is some kind of unhandled repeat it should
+	    #   definitely be addressed.  record a different processing
+	    #   type for these cases for future review/fixes
+	  }
+	}
+      }
+
+      die unless $ref_up and $ref_down and $interstitial;
+      trim_flanking(\$ref_up, \$ref_down);
+
+      my $fz2_pattern = sprintf '%s%s%s%s%s',
+	$ref_up, BREAKPOINT_ITD_LEFT,
+	  $interstitial,
+	    BREAKPOINT_ITD_RIGHT, $ref_down;
+
+      $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern;
+      $found_simple_itd = 1;
+      $row->{$F_PROCESSING_TYPE} = $found_repeat ?
+	"single_alignment_itd" : "single_alignment_insertion";
+    } else {
+      die "simple ITD: multiple HSPs with possible candidates!";
+      # example?
+    }
+  }
+
+  return $found_simple_itd;
+}
+
+
+sub pure_insertion_check {
+  # event has a portion of the query sequence which is not aligned to
+  # the reference at all.  HSPs have no overlap to the reference,
+  # with near-abuting coverage.
+  my (%options) = @_;
+  my $hsps = $options{"-hsps"} || die;
+  my $rs_seq = $options{"-reference-sequence"} || die;
+  my $query_seq = $options{"-query-sequence"} || die;
+  my $features = $options{"-features"} || die;
+  my $row = $options{"-row"} || die;
+  my $found_pure_insertion = 0;
+
+  if (@{$hsps} >= 2) {
+    my @candidate_i;
+    my $final = scalar @{$hsps} - 2;
+    #
+    #  find HSP pairs where subject alignments abut, or nearly so
+    #
+    for (my $i = 0; $i <= $final; $i++) {
+      my $left_ref_end = $hsps->[0]->end("subject");
+      my $right_ref_start = $hsps->[$i + 1]->start("subject");
+
+      if ($right_ref_start >= $left_ref_end) {
+	# subject intervals are also ordered left to right
+	my $subject_gap = $right_ref_start - $left_ref_end - 1;
+	die "fix me, negative subject gap" if $subject_gap < 0;
+	# maybe hsp overlap?
+	if ($subject_gap <= $ITD_PURE_INSERTION_MAX_SUBJECT_GAP) {
+	  push @candidate_i, $i;
+	}
+      }
+    }
+
+    if (@candidate_i) {
+      die "multiple simple insertion candidate HSP pairs" if @candidate_i > 1;
+      my ($i) = @candidate_i;
+      my $hi_left = new HSPIndexer("-hsp" => $hsps->[$i]);
+      my $hi_right = new HSPIndexer("-hsp" => $hsps->[$i + 1]);
+
+      if (query_overlap_rescue($hi_left, $hi_right, $features)) {
+	confess "TEST ME: query overlap for possible simple insertion";
+      }
+
+#      hsp_debug($hi_left, $hi_right);
+      my $gbc = $options{"-gbc"} || die;
+      itd_feature_annotate($row, $gbc, $hi_left, $hi_right);
+
+      my $ref_up = substr($rs_seq,
+			  0,
+			  $hi_left->end("subject"));
+      my $ref_down = substr($rs_seq,
+			    $hi_right->start("subject") - 1);
+
+      my $int_start = $hi_left->end("query") + 1;
+      my $int_end = $hi_right->start("query") - 1;
+      # start/end bases of interstitial sequence
+
+      my $interstitial = substr($query_seq,
+				$int_start - 1,
+				($int_end - $int_start) + 1);
+      trim_flanking(\$ref_up, \$ref_down);
+
+      my $fz2_pattern = sprintf '%s%s%s%s%s',
+	$ref_up, BREAKPOINT_ITD_LEFT,
+	  $interstitial,
+	    BREAKPOINT_ITD_RIGHT, $ref_down;
+
+      $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern;
+
+      $row->{$F_PROCESSING_TYPE} = "insertion_multi_hsp";
+
+      $found_pure_insertion = 1;
+    }
+  }
+
+  return $found_pure_insertion;
+}
+
+sub pure_deletion_check {
+  # event has 2 HSPs where query coverage is contiguous, but
+  # skips a portion of the subject sequence (i.e., deletion).
+  my (%options) = @_;
+  my $hsps = $options{"-hsps"} || die;
+  my $rs_seq = $options{"-reference-sequence"} || die;
+  my $query_seq = $options{"-query-sequence"} || die;
+  my $features = $options{"-features"} || die;
+  my $row = $options{"-row"} || die;
+  my $gbc = $options{"-gbc"} || die;
+
+  my $found_pure_deletion;
+
+  if (@{$hsps} >= 2) {
+    my @candidate_i;
+    my $final = scalar @{$hsps} - 2;
+    #
+    #  find HSP pairs where subject alignments abut, or nearly so
+    #
+    for (my $i = 0; $i <= $final; $i++) {
+      my $left_ref_end = $hsps->[0]->end("subject");
+      my $right_ref_start = $hsps->[$i + 1]->start("subject");
+
+      my $left_query_end = $hsps->[0]->end("query");
+      my $right_query_start = $hsps->[$i + 1]->start("query");
+
+      if ($right_ref_start >= $left_ref_end) {
+	# subject intervals are also ordered left to right
+	my $query_gap = $right_query_start - $left_query_end - 1;
+#	die "fix me, negative query gap" if $query_gap < 0;
+	# don't think this is important at this stage, candidates
+	# will be trimmed later
+	if ($query_gap <= $ITD_PURE_DELETION_MAX_QUERY_GAP) {
+	  # query coverage expected to be contiguous or nearly so
+	  push @candidate_i, $i;
+	}
+      }
+    }
+
+    if (@candidate_i) {
+      die "multiple simple deletion candidate HSP pairs" if @candidate_i > 1;
+      my ($i) = @candidate_i;
+      my $hi_left = new HSPIndexer("-hsp" => $hsps->[$i]);
+      my $hi_right = new HSPIndexer("-hsp" => $hsps->[$i + 1]);
+
+      query_overlap_rescue($hi_left, $hi_right, $features);
+
+      hsp_debug($hi_left, $hi_right);
+
+      #$row->{genea_feature} = $gbc->get_feature_for_base_number($left_subj_end);
+      # $row->{geneb_feature} = $gbc->get_feature_for_base_number($right_subj_start);
+
+      itd_feature_annotate($row, $gbc, $hi_left, $hi_right);
+
+      my $ref_up = substr($rs_seq,
+			  0,
+			  $hi_left->end("subject"));
+      my $ref_down = substr($rs_seq,
+			    $hi_right->start("subject") - 1);
+
+      my $int_start = $hi_left->end("query") + 1;
+      my $int_end = $hi_right->start("query") - 1;
+      # start/end bases of interstitial sequence
+
+      my $interstitial = substr($query_seq,
+				$int_start - 1,
+				($int_end - $int_start) + 1);
+      trim_flanking(\$ref_up, \$ref_down);
+
+      my $fz2_pattern = sprintf '%s%s%s%s%s',
+	$ref_up, BREAKPOINT_ITD_LEFT,
+	  $interstitial,
+	    BREAKPOINT_ITD_RIGHT, $ref_down;
+
+      $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern;
+
+      $row->{$F_PROCESSING_TYPE} = "deletion_multi_hsp";
+
+      $found_pure_deletion = 1;
+    }
+  }
+
+  return $found_pure_deletion;
+}
+
+sub subject_overlap_check {
+  my (%options) = @_;
+  my $hsps = $options{"-hsps"} || die;
+  my $rs_seq = $options{"-reference-sequence"} || die;
+  my $query_seq = $options{"-query-sequence"} || die;
+  my $features = $options{"-features"} || die;
+  my $row = $options{"-row"} || die;
+  my $si_subject = $options{"-si-subject"} || die;
+  my $spans_s = $options{"-spans-s"} || die;
+
+  my $found_subject_overlap = 0;
+
+  #
+  #  find cases where multiple HSPs match some subset of the reference
+  #  (i.e. the ITD sequence):
+  #
+  my %intersect;
+  for (my $i = 0; $i < @{$hsps}; $i++) {
+    for (my $j = 0; $j < @{$hsps}; $j++) {
+      if ($i != $j) {
+	my $si_i = $si_subject->[$i];
+	my $si_j = $si_subject->[$j];
+	my $intersect = intersect $si_i $si_j;
+	if (size $intersect) {
+	  my $key = join "-", sort {$a <=> $b} ($i, $j);
+	  $intersect{$key} = [ size $intersect, $intersect ];
+	  printf STDERR "intersect %s %s (%s, len=%d, detail=%s)\n", $spans_s->[$i], $spans_s->[$j], $key, size $intersect, run_list $intersect;
+	  # TO DO: ignore de minimis overlaps for this purpose?
+	}
+      }
+    }
+  }
+
+  my ($hi_left, $hi_right);
+  my ($subject_overlap_start, $subject_overlap_end);
+  my $subject_overlap_chunk = "";
+
+  if (%intersect) {
+    #
+    #  duplicated region in subject detected
+    #
+    my @best = sort {$intersect{$b}->[0] <=> $intersect{$a}->[0]}
+      keys %intersect;
+
+    if (@best > 1) {
+      # seem dubious
+      push @{$features}, sprintf "multiple_candidates_for_subject_overlap";
+      # TO DO: add to warnings list instead??
+    } elsif (@best == 1) {
+      #
+      # single candidate.
+      # if we sort and pick the best one we will force dubious cases
+      # like test_FLT3_4_hsp_with_intronic_sequence.tab,
+      # where the contig contains a continuous run of exonic and
+      # intronic sequence and therefore seems dubious.
+      #
+      push @{$features}, "blast_subject_overlap";
+      my $key = $best[0];
+      my ($i_first, $i_second) = split /\-/, $key;
+      die "HSPs not consecutive" unless $i_second - $i_first == 1;
+      my $hsp_left = $hsps->[$i_first];
+      my $hsp_right = $hsps->[$i_second];
+
+      $hi_left = new HSPIndexer("-hsp" => $hsp_left);
+      $hi_right = new HSPIndexer("-hsp" => $hsp_right);
+      # translates between query and hit base numbers and string.
+      # for both of these operations we need a position translation
+      # table that accounts for gaps in the alignment.
+      #
+      # These should be used rather than the HSP in downstream
+      # code, because the alignments may undergo trimming
+
+      if (1) {
+	my $int = $intersect{$key}->[1];
+	printf STDERR "debug raw subject intersection: %s\n",
+	  run_list $int;
+      }
+
+      my $int;
+      # subject intersection
+
+      if (query_overlap_rescue($hi_left, $hi_right, $features)) {
+	$int = $hi_left->get_intersection("subject", $hi_right);
+	# recalculate subject intersection after rescue adjustment
+      } else {
+	# no query overlap found, so we can use already-calculated
+	# subject intersection
+	$int = $intersect{$key}->[1];
+      }
+
+      # after any query overlap trimming, verify HSPs are
+      # ordered not just for the query sequence but for the
+      # subject sequence:
+      if ($hi_right->start("subject") < $hi_left->start("subject")) {
+	# sanity check
+	push @{$features}, "subject_overlap_but_HSPs_out_of_order";
+	#	    confess sprintf "FATAL ERROR: subject regions in query-ordered HSPs are out of order (query left subject start=%d, query right subject start=%d. possible large ITD?",
+	#	      $hi_left->start("subject"),
+	#		$hi_right->start("subject");
+      } else {
+	my $left_q_end = $hi_left->end("query");
+	my $right_q_start = $hi_right->start("query");
+
+	my $q_gap = ($right_q_start - $left_q_end) - 1;
+	if ($q_gap > $ITD_MAX_QUERY_GAP) {
+	  # disqualified: contig not compatible with this isoform?
+	  push @{$features}, sprintf "query_overlap_but_long_query_gap=%d", $q_gap;
+	} else {
+	  # OK, any query gap within tolerances
+	  my $rl = run_list $int;
+	  die "overlap $rl not a simple range" unless $rl =~ /^\d+\-\d+$/;
+	  # may need updates if there are gaps
+	  ($subject_overlap_start, $subject_overlap_end) = split /\-/, $rl;
+	  # TO DO:
+	  # if there are more than 2 HSPs, how to decide which
+	  # copy of the duplication to keep?  What if the second
+	  # copy has more contiguous alignment to the reference
+	  # afterward?  Need an example
+	  $subject_overlap_chunk = substr($rs_seq, $subject_overlap_start - 1,
+					  ($subject_overlap_end - $subject_overlap_start) + 1);
+	  printf STDERR "subject overlap chunk: %s\n", $subject_overlap_chunk;
+	  $found_subject_overlap = 1;
+	}
+      }
+    }
+  }
+
+  if ($found_subject_overlap) {
+
+    my $q_interstitial_start_base = $hi_left->get_query_base_for_hit_base($subject_overlap_end) + 1;
+    # left HSP: get the query string base number immediately after
+    # the end of the first copy of the ITD sequence (which is part
+    # of the reference sequence).  This marks the start of the
+    # interstitial sequence in the pattern, i.e. the beginning of
+    # the ITD proper.
+
+    #      die substr($contig, $q_interstitial_start_base - 1);
+
+
+    my $q_interstitial_end_base = $hi_right->get_query_base_for_hit_base($subject_overlap_end);
+    # right HSP: the final base of the overlap range marks the end of
+    # the interstitial sequence, i.e. the end of the second copy of
+    # the ITD sequence.
+
+    my $q_interstitial = substr($query_seq,
+				$q_interstitial_start_base - 1,
+				($q_interstitial_end_base - $q_interstitial_start_base) + 1);
+    # chunk of the query sequence containing the duplicated sequence
+    # and possibly some additional interstitial sequence
+
+    # for upstream and downstream sequences, use the reference sequence
+    # rather than the query sequence, as some query sequences may contain
+    # intronic sequence.  This code assumes pure RNA junctions without
+    # e.g. intron retention.
+
+    my $reference_upstream = substr($rs_seq,
+				    0,
+				    $subject_overlap_end);
+    my $reference_downstream = substr($rs_seq, $subject_overlap_end);
+
+    die unless $rs_seq eq $reference_upstream . $reference_downstream;
+    # QC/sanity
+
+    trim_flanking(\$reference_upstream, \$reference_downstream);
+
+    my $fz2_pattern = sprintf '%s%s%s%s%s',
+      $reference_upstream, BREAKPOINT_ITD_LEFT,
+	# from the reference, not the query
+	$q_interstitial,
+	  # from the query, 2nd copy of duplicate sequence plus
+	  # any miscellaneous interstitial sequence
+	  BREAKPOINT_ITD_RIGHT, $reference_downstream;
+    # from the reference, not the query
+
+    if ($fz2_pattern =~ s/($subject_overlap_chunk)}($subject_overlap_chunk){$/\}$1\{$2/) {
+      # only possible for perfect duplications
+      push @{$features}, "rescued_second_repeat_at_right_end";
+    }
+
+    printf STDERR "reference: %s\n", $rs_seq;
+    printf STDERR "query: %s\n", $query_seq;
+    printf STDERR "subject overlap: %s\n", $subject_overlap_chunk;
+    printf STDERR "interstitial: %s\n", $q_interstitial;
+    printf STDERR "ref upstream: %s\n", $reference_upstream;
+    printf STDERR "ref downstream: %s\n", $reference_downstream;
+    printf STDERR "fz2 pattern: %s\n", $fz2_pattern;
+
+    $row->{$F_PATTERN_SEQUENCE} = $fz2_pattern;
+    $row->{detected_repeat} = $subject_overlap_chunk;
+  }
+
+  return $found_subject_overlap;
+}
+
+sub yes_no {
+  my ($v) = @_;
+  return $v ? "yes" : "no";
+}
+
+sub complex_indel_check {
+  my (%options) = @_;
+  my $hsps = $options{"-hsps"} || die;
+  my $rs_seq = $options{"-reference-sequence"} || die;
+  my $query_seq = $options{"-query-sequence"} || die;
+  my $features = $options{"-features"} || die;
+  my $row = $options{"-row"} || die;
+  my $gbc = $options{"-gbc"} || die;
+
+  my $found_complex = 0;
+
+  if (@{$hsps} == 1) {
+    # find start and end of perfect portion of alignment
+    my $hi = new HSPIndexer("-hsp" => $hsps->[0]);
+    my ($start_q, $start_h) = find_perfect_edge($hi, "start");
+    my ($end_q, $end_h) = find_perfect_edge($hi, "end");
+    # these are the upstream and downstream edges, rather than
+    # the edges of the interstitial region
+
+    if ($start_q < $end_q) {
+      # gap region identified
+      my $ref_up = substr($rs_seq,
+			  0,
+			  $start_h);
+      my $ref_down = substr($rs_seq, $end_h - 1);
+
+      my $q_interstitial = substr($query_seq,
+				$start_q - 1,
+				($end_q - $start_q)
+			       );
+
+      if (length($q_interstitial) >= $ITD_COMPLEX_MIN_LENGTH) {
+	# qualifies
+	$found_complex = 1;
+
+	$row->{genea_feature} = $gbc->get_feature_for_base_number($start_h);
+	$row->{geneb_feature} = $gbc->get_feature_for_base_number($end_h);
+
+	trim_flanking(\$ref_up, \$ref_down);
+	my $fz2_pattern = sprintf '%s%s%s%s%s',
+	  $ref_up, BREAKPOINT_ITD_LEFT,
+	    # from the reference, not the query
+	    $q_interstitial,
+	      BREAKPOINT_ITD_RIGHT, $ref_down;
+	# from the reference, not the query
+
+	my $i_s_start = $start_h + 1;
+        my $i_s_end = $end_h - 1;
+	my $s_interstitial = substr($rs_seq,
+				  $i_s_start - 1,
+				  ($i_s_end - $i_s_start) + 1);
+
+#	my $s_interstitial = substr($rs_seq,
+#			    $start_h + 1,
+
+	push @{$features}, sprintf "complex_sub=%s>%s", $s_interstitial, $q_interstitial;
+	$row->{$F_PATTERN_SEQUENCE} = $fz2_pattern;
+	$row->{$F_PROCESSING_TYPE} = "complex_sub";
+      }
+    }
+  }
+
+  return $found_complex;
+}
+
+sub find_perfect_edge {
+  my ($hi, $type) = @_;
+  my ($q_pos, $h_pos);
+  my ($last_q_pos, $last_h_pos);
+  my $direction;
+  if ($type eq "start") {
+    $q_pos = $hi->start("query");
+    $h_pos = $hi->start("subject");
+    $direction = 1;
+  } elsif ($type eq "end") {
+    $q_pos = $hi->end("query");
+    $h_pos = $hi->end("subject");
+    $direction = -1;
+  } else {
+    die;
+  }
+
+  my $consider_n_mismatch = 0;
+
+  my $qb2hb = $hi->query_base_to_hit_base();
+  my $qb2s = $hi->query_base_to_sequence();
+  my $hb2s = $hi->hit_base_to_sequence();
+
+  my ($q_edge, $h_edge);
+
+  while (1) {
+    my $stop;
+    $h_pos = $qb2hb->{$q_pos};
+
+    if ($h_pos) {
+      # query base is aligned to subject base
+      if ($last_h_pos) {
+	# check for gap in subject sequence between query bases
+	my $diff = abs($last_h_pos - $h_pos);
+	if ($diff > 1) {
+#	  print STDERR "VERIFY: gap in subject at q $q_pos, diff=$diff\n";
+	  # TO DO: verify this is correct when we encounter an example
+	  $stop = 1;
+	}
+      }
+
+      my $q_base = $qb2s->{$q_pos} || die;
+      my $h_base = $hb2s->{$h_pos} || die;
+      if ($q_base ne $h_base) {
+	# query and hit base don't match
+#	die "mismatch for q $q_pos h $h_pos: $q_base $h_base";
+	if ($consider_n_mismatch) {
+	  $stop = 1;
+	} else {
+	  $stop = 1 unless uc($q_base) eq "N" or uc($h_base) eq "N";
+	}
+      }
+    } else {
+      # gap between query and subject
+      $stop = 1;
+    }
+
+    if ($stop) {
+      $q_edge = $last_q_pos;
+      $h_edge = $last_h_pos;
+      last;
+    }
+
+    $last_q_pos = $q_pos;
+    $last_h_pos = $h_pos;
+    # alignment is perfect here, save
+
+    $q_pos += $direction;
+    # next base to check
+  }
+
+  return ($q_edge, $h_edge);
+}
+
+
+sub hit2exons {
+  # BLAST reads in a fz2 hit file vs. gene models.
+  # what exons are hit?  do these match the source pattern?
+  my $f_hit = $FLAGS{hit2exons} || die;
+  my $wanted_read_id = $FLAGS{read};
+
+  my $MIN_UNMAPPED_QUERY_REGION_TO_REPORT = 10;
+  # setting?  maybe enough to blat?
+
+  find_binary("blastn", "-die" => 1);
+
+  my $blast = get_blast();
+  $blast->strand("");
+  # input reads may be on + or -
+
+  my $sort_by_span_score = $FLAGS{"sort-by-span-score"};;
+  $sort_by_span_score = 1 unless defined $sort_by_span_score;
+  # depends: for a large file will chew up a lot of RAM
+
+  printf STDERR "configuration:\n";
+  printf STDERR "  sort output by span_score?: %s\n", yes_no($sort_by_span_score);
+
+  my $gb_cache = new GenBankCache();
+
+  my $max_features = 5;
+  my @h_feat;
+  for (my $i=1; $i <= $max_features; $i++) {
+    push @h_feat, "f_" . $i;
+  }
+
+  my $rpt = new Reporter(
+			 "-file" => basename($f_hit) . ".cds.tab",
+			 "-delimiter" => "\t",
+			 "-labels" => [
+				       qw(
+					   pattern
+					   read
+					),
+				       "note",
+				       "summary",
+				       "exon_span_score",
+				       @h_feat
+				      ],
+			 "-auto_qc" => 1,
+			);
+
+
+  # scan results file, find reecords matching read pair ID
+
+  open(IN, $f_hit) || die;
+  my $h = <IN>;
+  chomp $h;
+  my @headers = split /\t/, $h;
+  # a pattern file is not a standard tab-delimited file so
+  # can't use DelimitedFile.pm
+
+  my @rows_out;
+
+  while (<IN>) {
+    chomp;
+    my @f = split /\t/, $_;
+    my $pid;
+    if ($f[0] =~ /^read\-pairs/) {
+      # final line in file
+      last;
+    } elsif ($f[0] =~ /pattern (\S+)/) {
+      $pid = $1;
+    } else {
+      die "can't identify record type for " . $f[0];
+    }
+    die sprintf "record has %d cols, %s", scalar(@f), $_ unless @f == @headers;
+    # first line of each set refers to the pattern and uses the
+    # same number of columns
+    die sprintf "%s is not a pattern line: %s", $f[0], $_ unless $f[0] =~ "^pattern";
+    my %r;
+    @r{@headers} = @f;
+    # pattern definition line
+
+    for (my $i = 0; $i < 2; $i++) {
+      my $l_read = <IN> || die;
+      chomp $l_read;
+      my @f = split /\t/, $l_read;
+      die "not a read line" unless $f[0] =~ /^read (\S+)/;
+
+      my $read_id = $1;
+      # TO DO: record more details, etc.
+      if ($wanted_read_id) {
+	# limit to a specific pair
+	next unless $read_id eq $wanted_read_id;
+      }
+
+      # TO DO:
+      # maybe options to filter by fz2 hit type,
+      # count of reads matching multiple features, etc.
+
+
+      my $read_sequence = $f[1];
+      # NOTE: this is the aligned read sequence, which may be
+      # reverse-complemented from the original if mapped to -
+      $read_sequence =~ s/^\s+//;
+      $read_sequence =~ s/\s+$//;
+      die if $read_sequence =~ /\s/;
+
+#      dump_die(\%r, "new hit", 1);
+
+      # to do: filter to desired read ID?
+
+      #
+      # get accession from hit pattern annotation:
+      #
+      my $acc_a = $r{genea_acc} || die;
+      my $acc_b = $r{geneb_acc} || die;
+      die "different accessions" unless $acc_a eq $acc_b;
+      if ($acc_a =~ /,/) {
+	printf STDERR "multiple accessions in acc_a ($acc_a), using first\n";
+	my @set = split /,/, $acc_a;
+	$acc_a = $set[0];
+      }
+
+      #
+      # get GenBank info for refseq:
+      #
+      my $gbc = new GenBankCDS("-file" => $gb_cache->get($acc_a,
+							 "-single" => 1));
+      my $info = $gbc->get_info();
+      my $ref_seq = $info->{mrna_cds_with_utr5} || die;
+
+
+      # blast (either strand!) of given read
+      # report annotations in read base position??
+
+      my $parser = $blast->blast(
+				 "-query" => {
+					      "read" => $read_sequence,
+					     },
+				 "-database" => {
+						 $acc_a => $ref_seq
+						}
+				);
+      my $result = $parser->next_result();
+      # one object per query sequence (only one query seq)
+
+      my @hits;
+      while (my $hit = $result->next_hit()) {
+	push @hits, $hit;
+      }
+      die "no BLAST hits" unless @hits == 1;
+
+      my @hsps;
+      while (my $hsp = $hits[0]->next_hsp) {
+	push @hsps, $hsp;
+      }
+      @hsps = sort {$a->start("query") <=> $b->start("query")} @hsps;
+      die "no HSPs!" unless @hsps;
+
+      my %feature2query;
+      my @f_ordered;
+
+      my $unmapped_query_region_counter = 0;
+
+      for (my $hit_idx = 0; $hit_idx < @hsps; $hit_idx++) {
+	my $hsp = $hsps[$hit_idx];
+
+	if ($hit_idx > 0) {
+	  # check for gap in query sequence between HSPs
+	  my $hsp_prev = $hsps[$hit_idx - 1];
+
+	  my $q_gap_start = $hsp_prev->end("query") + 1;
+	  my $q_gap_end = $hsp->start("query") - 1;
+	  my $q_gap_size = ($q_gap_end - $q_gap_start) + 1;
+	  if ($q_gap_size >= $MIN_UNMAPPED_QUERY_REGION_TO_REPORT) {
+	    my $feature = sprintf "unknown_%d", ++$unmapped_query_region_counter;
+	    push @f_ordered, $feature;
+	    for (my $qb = $q_gap_start; $qb <= $q_gap_end; $qb++) {
+	      $feature2query{$feature}{$qb} = 1;
+	    }
+	  }
+	}
+
+	my $hi = new HSPIndexer("-hsp" => $hsp);
+	my $qstr = $hsp->strand("query");
+	my $hstr = $hsp->strand("hit");
+
+	my ($qs, $qe) = $hsp->range("query");
+	my ($hs, $he) = $hsp->range("hit");
+	printf STDERR "strand q:%s h:%s  range q:%d-%d h:%d-%d\n",
+	  $qstr, $hstr,
+	      $qs, $qe, $hs, $he;
+
+	die sprintf "query strand %s", $qstr unless $qstr == 1;
+	die sprintf "hit strand %s", $hstr unless $hstr == 1;
+	# I *think* the read sequence should always be on the same
+	# sequence as the gene model, because fz2 reverse-complements
+	# as necessary to match the pattern, which is always in the
+	# gene model's orientation rather than genome orientation
+
+	for (my $bn = $hs; $bn < $he; $bn++) {
+	  my $feature = $gbc->get_feature_for_base_number($bn);
+	  push @f_ordered, $feature;
+	  my $qb = $hi->get_query_base_for_hit_base($bn);
+
+	  if (my $qb = $hi->get_query_base_for_hit_base($bn)) {
+	    $feature2query{$feature}{$qb} = 1;
+	  }
+	}
+      }
+
+      my $features_ordered = unique_ordered_list(\@f_ordered);
+
+      die "more than $max_features features" if @{$features_ordered} > $max_features;
+
+
+      my %r;
+      $r{pattern} = $pid;
+#      $r{read} = $read_id;
+      $r{read} = excel_blat_hyperlink($read_sequence, $read_id);
+      $r{accession} = $acc_a;
+
+      my $summary = join "-", @{$features_ordered};
+      $summary =~ s/exon_/ex/g;
+      $summary =~ s/unknown_\d+/unknown/g;
+      $r{summary} = $summary;
+      # summary of events covered by this read
+
+      # does the read show evidence of a large duplication,
+      # i.e. where earlier exons are suddenly repeated?:
+      my $exons_out_of_order;
+      my $last_exon;
+      foreach (@{$features_ordered}) {
+	if (/exon_(\d+)/) {
+	  my $this_exon = $1;
+	  $exons_out_of_order = 1 if $last_exon and $this_exon < $last_exon;
+	  $last_exon = $this_exon;
+	}
+      }
+      my @notes;
+      push @notes, "exons_out_of_order" if $exons_out_of_order;
+      $r{note} = join ",", @notes;
+
+      my %exon_lengths;
+      for (my $fi = 0; $fi < $max_features; $fi++) {
+	my $feature = "";
+	my $interval = "";
+	my $sequence = "";
+	my $blat = "";
+
+	if ($fi < @{$features_ordered}) {
+	  $feature = $features_ordered->[$fi];
+	  my $span = new Set::IntSpan(keys %{$feature2query{$feature}});
+	  my ($qs, $qe) = si2range($span);
+	  $interval = run_list $span;
+
+	  $sequence = substr($read_sequence,
+			     $qs - 1,
+			     ($qe - $qs) + 1);
+	  die "??? $read_sequence" unless $sequence =~ /\w/;
+
+	  my $flen = length($sequence);
+	  $exon_lengths{$feature} = $flen if $feature =~ /exon/;
+
+	# https://genome.ucsc.edu/cgi-bin/hgBlat?org=Human&db=hg38&userSeq=AGTGCATCCATGAACTCTGGGGTTCTTCTGGTTCGG&type=Blat%27s%20guess
+
+	  $blat = excel_blat_hyperlink($sequence,
+				       sprintf "%s (%d)", $feature, $flen
+				      );
+	}
+
+	my $h = "f_" . ($fi + 1);
+	$r{$h} = $blat;
+#	printf STDERR "%s: %s: %d-%d, %s\n", $read_id, $feature, $qs, $qe, $query_chunk;
+      }
+
+      my $span_score;
+      my @span_lengths = sort {$a <=> $b} values %exon_lengths;
+      if (@span_lengths == 2) {
+	$span_score = $span_lengths[0] / $span_lengths[1];
+	# the closer the two span sizes are, the higher the score
+      } elsif (@span_lengths > 2) {
+#	die sprintf "fix me, more than 2 spans found!: %s, %s", join(",", keys %exon_lengths), join ",", @span_lengths;
+	$span_score = $span_lengths[$#span_lengths - 1] / $span_lengths[$#span_lengths];
+	# seems odd, look into this case more
+      } else {
+	$span_score = 0;
+      }
+      $r{exon_span_score} = $span_score == 0 ? 0 : sprintf "%.2f", $span_score;
+
+      if ($sort_by_span_score) {
+	push @rows_out, \%r;
+      } else {
+	$rpt->end_row(\%r);
+      }
+
+      # TO DO:
+      # also track portions of query read that don't match refseq,
+      # e.g. intronic
+    }
+  }
+
+  if ($sort_by_span_score) {
+    @rows_out = sort {$b->{exon_span_score} <=> $a->{exon_span_score}} @rows_out;
+    foreach my $r (@rows_out) {
+      $rpt->end_row($r);
+    }
+  }
+
+  $rpt->finish();
+}
+
+sub excel_blat_hyperlink {
+  my ($sequence, $label) = @_;
+  my %vars;
+  $vars{org} = "Human";
+  $vars{db} = "hg38";
+  $vars{userSeq} = $sequence;
+  $vars{type} = "Blat%27s%20guess";
+  # hack, could encode ourselves
+  my $url = sprintf 'https://genome.ucsc.edu/cgi-bin/hgBlat?%s', join "&", map {join "=", $_, $vars{$_}} sort keys %vars;
+  my $blat = sprintf '=HYPERLINK("%s","%s")', $url, $label;
+  # converts to native Excel link
+  return $blat;
+}
+
+sub hsp_debug {
+  my ($hi_left, $hi_right, $tag) = @_;
+  $tag = "alignment" unless $tag;
+  printf STDERR "%s:\n", $tag;
+  printf STDERR "   left: q=%d-%d h=%d-%d\n",
+    $hi_left->start("query"), $hi_left->end("query"),
+      $hi_left->start("subject"), $hi_left->end("subject");
+  printf STDERR "  right: q=%d-%d h=%d-%d\n",
+    $hi_right->start("query"), $hi_right->end("query"),
+      $hi_right->start("subject"), $hi_right->end("subject");
+}
+
+sub get_gene {
+  my ($row, $end) = @_;
+  my $f;
+  if ($end eq "A") {
+    $f = $F_GENE_A;
+  } elsif ($end eq "B") {
+    $f = $F_GENE_B;
+  } else {
+    die "end must be A or B";
+  }
+
+  my $gene;
+  if (exists $row->{$f}) {
+    $gene = $row->{$f};
+  } elsif ($gene = $FLAGS{gene}) {
+    # command-line override, e.g. UBTF
+  } else {
+    dump_die($row, "no field $f");
+  }
+  return $gene;
+}
+
+sub merge_pattern_files {
+  # merge fz2 pattern files and:
+  #  - unique-ify pattern IDs
+  #  - harmonize output format by merging to core/shared columns only
+  #  - write pattern.tab files?
+  # output can then be run through "condense" process
+
+  my $header_policy = $FLAGS{"header-policy"} || die "-header-policy [core|first|clone]";
+
+  my @infiles = @PATTERN_FILES;
+  foreach my $f_list (@SRC_FILES) {
+    # listfiles
+    my $files = read_simple_file($f_list) || die;
+    foreach my $f_src (@{$files}) {
+      my $f_out = basename($f_src) . ".fz2.tab";
+      if (-s $f_out) {
+	push @infiles, $f_out;
+      } else {
+	die "can't find outfile $f_out for infile $f_src";
+      }
+    }
+  }
+
+  my $append_source = $FLAGS{"append-source"};
+
+  my $h_out;
+  if ($header_policy eq "core") {
+    $h_out = \@H_FZ2_CORE;
+    # strip output to core/shared columns only
+  } elsif ($header_policy eq "first") {
+    # follow the format of the first file specified
+    my $df = new DelimitedFile("-file" => $infiles[0],
+			       "-headers" => 1,
+			      );
+    $h_out = $df->headers_raw();
+  } elsif ($header_policy eq "clone") {
+    my $df = new DelimitedFile(
+			       "-file" => ($FLAGS{patterns} || die "-patterns"),
+			       "-headers" => 1,
+			      );
+    $h_out = $df->headers_raw();
+  } else {
+    die "-header-policy must be core|first|clone";
+  }
+  die unless $h_out;
+
+  my $f_out = $FLAGS{out} || "merged.tab";
+
+  my %pid;
+  # unique pattern IDs
+  my %prefix2num;
+  # observed numbers for a given pattern prefix
+
+  my @out_main;
+  my @out_prepend;
+  # output rows
+
+  my %patch = split /,/, $FLAGS{patch} || "";
+  my $blank_undef = $FLAGS{"blank-undef"};
+  my $prepend_secondary = $FLAGS{"prepend-secondary"};
+
+  my $file_count = 0;
+  foreach my $f_in (@infiles) {
+    my $df = new DelimitedFile("-file" => $f_in,
+			       "-headers" => 1,
+			      );
+    my $is_secondary = ++$file_count > 1;
+
+    my $f_pattern = basename($f_in) . ".pattern.tab";
+    my $rpt_pattern = $df->get_reporter(
+				       "-file" => $f_pattern
+				      );
+    # input files, patched with updated/unique-ified pattern ID
+
+    while (my $row = $df->get_hash()) {
+      my $pid_in = $row->{pattern} || die;
+
+      my $pid_out;
+      if ($pid{$pid_in}) {
+	my ($prefix, $num) = get_prefix($pid_in);
+	my @set = sort {$b <=> $a} @{$prefix2num{$prefix}};
+	$pid_out = sprintf '%s-%02d', $prefix, $set[0] + 1;
+      } else {
+	# unique already
+	$pid_out = $pid_in;
+      }
+
+      my ($prefix, $num) = get_prefix($pid_out);
+      push @{$prefix2num{$prefix}}, $num;
+      # track observed pattern numbers
+
+      $pid{$pid_out} = 1;
+      # unique pattern ID list
+
+      $row->{pattern} = $pid_out;
+
+      $rpt_pattern->end_row($row);
+      # copy of source file with pattern ID updated
+
+      if (%patch) {
+	# optionally patch in missing column data
+	foreach my $h (keys %patch) {
+	  $row->{$h} = $patch{$h} unless exists $row->{$h};
+	}
+      }
+
+      if ($header_policy eq "first" or $blank_undef) {
+	# output follows the format of the first file.
+	# populate any columns not specified in other files with blanks.
+	foreach my $h (@{$h_out}) {
+	  $row->{$h} = "" unless exists $row->{$h};
+	}
+      }
+
+      if ($append_source) {
+	my @sources = split /,/, $row->{$F_SOURCE} || "";
+	my %src = map {$_, 1} @sources;
+	my $src = file_to_source($f_in);
+	unless ($src{$src}) {
+	  $row->{$F_SOURCE} = join ",", @sources, $src;
+	}
+      }
+
+      if ($is_secondary and $prepend_secondary) {
+	push @out_prepend, $row;
+      } else {
+	push @out_main, $row;
+      }
+    }
+    $rpt_pattern->finish();
+  }
+
+  #
+  #  write merged file:
+  #
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => $h_out,
+			 "-auto_qc" => 1,
+			);
+
+  foreach my $r (@out_prepend, @out_main) {
+    $rpt->end_row($r);
+  }
+
+  $rpt->finish();
+  # merged file
+
+
+}
+
+
+sub get_prefix {
+  my ($pid) = @_;
+  my $prefix = $pid;
+  $prefix =~ s/\-(\d+)$// || die;
+  return ($prefix, int $1);
+}
+
+sub cicero_clone_patch {
+  # clone fz2 core annotation fields from CICERO-format input
+  my ($row) = @_;
+  my %map = (
+	     "genea_symbol" => [ "geneA" ],
+	     "genea_chr" => [ "chrA" ],
+	     "genea_pos" => [ "genea_pos_adj", "posA" ],
+	     # use adjusted position if field is present,
+	     # otherwise use raw CICERO position
+
+	     "geneb_symbol" => [ "geneB" ],
+	     "geneb_chr" => [ "chrB" ],
+	     "geneb_pos" => [ "geneb_pos_adj", "posB" ],
+	    );
+  foreach my $f_out (keys %map) {
+    unless (exists $row->{$f_out}) {
+      my $set_in = $map{$f_out} || die;
+      my $v;
+      foreach my $f_in (@{$set_in}) {
+	if (exists $row->{$f_in}) {
+	  $v = $row->{$f_in};
+	  last;
+	}
+      }
+      dump_die($row, "no mappable value for $f_out") unless defined $v;
+      $row->{$f_out} = $v;
+    }
+  }
+
+  $row->{pathogenicity_somatic} = "" unless exists $row->{pathogenicity_somatic};
+  # doesn't exist for some sources, so not a fatal error
+
+}
+
+sub itd_feature_annotate {
+  my ($row, $gbc, $hi_left, $hi_right) = @_;
+  my $left_subj_end = $hi_left->end("subject");
+  my $right_subj_start = $hi_right->start("subject");
+  $row->{genea_feature} = $gbc->get_feature_for_base_number($left_subj_end);
+  $row->{geneb_feature} = $gbc->get_feature_for_base_number($right_subj_start);
+}
+
+sub file_to_tag {
+  my ($infile) = @_;
+  my $infile_tag = basename($infile);
+  $infile_tag =~ s/\..*//;
+  return $infile_tag;
+}
+
+sub standardize_genome {
+  my ($g) = @_;
+  my $result;
+  if ($g eq "GRCh37-lite" or $g eq "hg19") {
+    $result = 37;
+  } elsif ($g eq "GRCh38") {
+    $result = 38;
+  } else {
+    die "can't standardize genome string $g";
+  }
+  return $result;
+}
+
+sub del2fuzzion {
+  # create RNA pattern from genomic deletion specification
+  # TO DO:
+  # - support partial deletion of exons
+  # - support "any_result_ok" in failed file output a-la ITD code
+  my $f_in = $FLAGS{del2fuzzion} || die "-del2fuzzion";
+  my $fai = get_fai();
+  my $rf = get_refflat();
+
+  my $f_out = $FLAGS{out} || basename($f_in) . ".fz2.tab";
+  my $f_failed = basename($f_in) . ".fz2_failed.tab";
+
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => \@H_FZ2_CORE,
+			);
+
+  my $source = file_to_source($f_in);
+
+  my $df = new DelimitedFile("-file" => $f_in,
+			     "-headers" => 1,
+			     );
+
+  my $verbose = 0;
+  my %pattern_counter;
+
+  my $rpt_failed = $df->get_reporter("-file" => $f_failed,
+				     "-extra" => [
+						  "accession",
+						  "exception"
+						 ]
+				    );
+
+
+  while (my $row = $df->get_hash()) {
+    my $gene = $row->{gene} || die "no gene";
+    my $chr = $row->{chr} || die "no chr";
+    my $del_start = $row->{del_start} || die "no del_start";
+    my $del_end = $row->{del_end} || die "no del_end";
+    my $si_del = new Set::IntSpan sprintf '%d-%d', $del_start, $del_end;
+
+    my $hits = $rf->find_by_gene($gene);
+    die "no refflat entries for $gene" unless $hits and @{$hits};
+    foreach my $rfr (@{$hits}) {
+      my $acc = $rfr->{name} || die;
+      die "refflat accession $acc not versioned, use e.g. ncbiRefSeq table insted" unless $acc =~ /\.\d+$/;
+      if (compare_chrom($chr, $rfr->{chrom})) {
+	my $exons = $rfr->{exons};
+
+	my $rl_exons = join ",", map {join "-", @{$_}{qw(start end)}} @{$exons};
+	my @exons = split /,/, $rl_exons;
+	printf STDERR "in: %s\n", $rl_exons if $verbose;
+
+	my $si_exons = new Set::IntSpan $rl_exons;
+
+	my $intersect = intersect $si_del $si_exons;
+	if ($intersect->size()) {
+	  # gene model intersects target deletion
+	  my $exons_out = diff $si_exons $si_del;
+	  # exonic ranges ex-deletion
+
+	  printf STDERR "intersect: %s\n", $intersect->run_list() if $verbose;
+	  my $rl_out = run_list $exons_out;
+	  printf STDERR "non-intersect: %s\n", $rl_out if $verbose;
+
+	  my %exons_all = map {$_, 1} @exons;
+
+	  my @ex_out = split /,/, $rl_out;
+	  my %exons_out = map {$_, 1} @ex_out;
+
+	  foreach my $ex (keys %exons_out) {
+	    die sprintf "output exon %s not canonical, only whole-exon deletions currently supported" unless $exons_all{$ex};
+	    # TO DO
+	  }
+
+	  my @upstream;
+	  my @downstream;
+
+	  my $in_downstream;
+
+	  for my $exon (@exons) {
+	    if ($exons_out{$exon}) {
+	      if ($in_downstream) {
+		push @downstream, $exon;
+	      } else {
+		push @upstream, $exon;
+	      }
+	    } else {
+	      $in_downstream = 1;
+	    }
+	  }
+
+	  if ($verbose) {
+	    printf STDERR "up: %s\n", join ",", @upstream;
+	    printf STDERR "down: %s\n", join ",", @downstream;
+	  }
+
+	  my $exception;
+	  $exception = "no_upstream_sequence" unless @upstream;
+	  $exception = "no_downstream_sequence" unless @downstream;
+
+	  if ($exception) {
+	    my %r = %{$row};
+	    $r{accession} = $acc;
+	    $r{exception} = $exception;
+	    $rpt_failed->end_row(\%r);
+
+	    next;
+	  }
+
+	  my $strand = $rfr->{strand} || die;
+	  my $is_minus;
+	  if ($strand eq "+") {
+	  } elsif ($strand eq "-") {
+	    $is_minus = 1;
+	  } else {
+	    die "that's unpossible!";
+	    # ralph wiggum voice
+	  }
+
+	  my $upstream = "";
+	  my $breakpoint_a;
+	  foreach my $exon (@upstream) {
+	    my ($start, $end) = split /\-/, $exon;
+	    $breakpoint_a = $end;
+
+	    my $chunk = $fai->get_chunk(
+					"-id" => $chr,
+					"-start" => $start,
+					"-end" => $end
+				       );
+	    printf STDERR "chunk %s\n", $chunk if $verbose;
+	    $upstream .= $chunk;
+	  }
+
+	  my $downstream = "";
+	  my $breakpoint_b;
+	  foreach my $exon (@downstream) {
+	    my ($start, $end) = split /\-/, $exon;
+	    $breakpoint_b = $start unless $breakpoint_b;
+
+	    my $chunk = $fai->get_chunk(
+					"-id" => $chr,
+					"-start" => $start,
+					"-end" => $end
+				       );
+	    printf STDERR "chunk %s\n", $chunk if $verbose;
+	    $downstream .= $chunk;
+	  }
+
+	  if ($is_minus) {
+	    # adjust sequence for gene model on - strand
+	    my $delim = "_";
+	    my $contig = join($delim, $upstream, $downstream);
+#	    print STDERR "before: $contig\n";
+	    $contig = reverse_complement($contig);
+#	    print STDERR "after: $contig\n";
+	    ($upstream, $downstream) = split($delim, $contig);
+
+	    swap_variables(\$breakpoint_a, \$breakpoint_b);
+	  }
+
+	  trim_flanking(\$upstream, \$downstream);
+
+	  my $pattern = sprintf '%s%s%s%s',
+	    $upstream,
+	      BREAKPOINT_ITD_LEFT,
+		BREAKPOINT_ITD_RIGHT,
+		  $downstream;
+
+	  printf STDERR "pattern: %s\n", $pattern if $verbose;
+
+	  my %r;
+
+	  my $counter = ++$pattern_counter{$gene};
+	  my $pid = sprintf '%s-%s-%02d', $gene, $gene, $counter;
+	  $r{$F_PATTERN_ID} = $pid;
+	  $r{$F_PATTERN_SEQUENCE} = $pattern;
+	  $r{$F_SOURCE} = $source;
+	  $r{$F_SAMPLE} = $row->{sample} || die "no sample field in input";
+	  $r{$F_GENOME} = standardize_genome($FLAGS{genome} || die "-genome");
+	  $r{genea_symbol} = $r{geneb_symbol} = $gene;
+	  $r{genea_acc} = $r{geneb_acc} = $acc;
+	  $r{genea_chr} = $r{geneb_chr} = $chr;
+
+	  $r{genea_pos} = $breakpoint_a;
+	  $r{geneb_pos} = $breakpoint_b;
+	  $r{genea_feature} = get_feature_tag($rf, $rfr, $breakpoint_a);
+	  $r{geneb_feature} = get_feature_tag($rf, $rfr, $breakpoint_b);
+
+	  $r{pattern_generation_method} = "genomic_deletion";
+	  $r{$F_PATHOGENICITY_SOMATIC} = $row->{$F_PATHOGENICITY_SOMATIC} || "";
+
+	  generate_pair_summary(\%r);
+
+	  $rpt->end_row(\%r);
+
+	}
+      } else {
+	die "TEST: mapping to different chrom";
+      }
+
+    }  # $rfr
+  }  # $row
+
+  $rpt->finish();
+  $rpt_failed->finish();
+
+}
+
+
+sub compare_chrom {
+  my ($chr_a, $chr_b) = @_;
+  foreach ($chr_a, $chr_b) {
+    s/^chr//i;
+  }
+  return $chr_a eq $chr_b;
+}
+
+sub file_to_source {
+  my ($file) = @_;
+  my $source = basename($file);
+  $source =~ s/\..*// || die;
+  return $source;
+}
+
+sub swap_variables {
+  my ($ref1, $ref2) = @_;
+  printf STDERR "before: %s %s\n", $$ref1, $$ref2;
+  my $tmp = $$ref1;
+  $$ref1 = $$ref2;
+  $$ref2 = $tmp;
+  printf STDERR "after: %s %s\n", $$ref1, $$ref2;
+}
+
+sub dubious_junction_check {
+  # check for reasons to disqualify an ITD junction from having
+  # a fusion-style junction equivalent
+  #   - possible canonical junction
+  #   - very close junction produced by small duplication
+
+  my ($gbc, $rs_seq, $ref_up, $ref_down) = @_;
+
+  my $idx = index($rs_seq, $ref_up);
+  die if $idx == -1;
+  my $up_bp = $idx + length($ref_up);
+  # upstream breakpoint in reference sequence
+  my $up_feature = $gbc->get_feature_for_base_number($up_bp);
+
+  $idx = index($rs_seq, $ref_down);
+  die if $idx == -1;
+  my $down_bp = $idx + 1;
+  # downstream breakpoint in reference sequence
+
+#  die join "\n", $rs_seq, $ref_up, $ref_down, $up_bp, $down_bp;
+
+  my $down_feature = $gbc->get_feature_for_base_number($down_bp);
+
+#  for (my $i = $up_bp - 10; $i <= $down_bp + 10; $i++) {
+#    printf STDERR "%d: %s\n", $i, $gbc->get_feature_for_base_number($i);
+#  }
+
+  my $dubious = 0;
+
+  my $up_exon = $up_feature =~ /_(\d+)$/ ? $1 : die $up_feature;
+  my $down_exon = $down_feature =~ /_(\d+)$/ ? $1 : die $down_feature;
+
+  my $bp_distance = abs($down_bp - $up_bp);
+
+  printf STDERR "features: up=%s down=%s, bp distance=%d\n",
+    $up_feature, $down_feature, $bp_distance;
+
+  $dubious = 1 if $up_exon == $down_exon;
+  # due to microhomology during alignment, etc. the sites
+  # may not be perfect, so may appear nearby in the same exon
+  $dubious = 2 if $up_exon == $down_exon - 1;
+  # classic canonical junction breakpoint
+
+  printf STDERR "hey now: possible canonical junction detected: $up_exon $down_exon\n" if $dubious == 2;
+#      die "hey now: earlier junction up=$up_exon down=$down_exon" if $down_exon < $up_exon;
+
+  $dubious = 3 if $bp_distance < $ITD_MIN_BREAKPOINT_DISTANCE_FOR_ALTERNATE_PATTERN;
+
+  return $dubious;
+}
+
+sub check_identical_down {
+  # count of exactly matching bases from start of interstitial
+  # sequence to downstream sequence
+  my ($interstitial, $ref_down) = @_;
+  $interstitial = uc($interstitial);
+  $ref_down = uc($ref_down);
+  my $count_identical = 0;
+  my $len = length($interstitial);
+  for (my $i = 0; $i < $len; $i++) {
+    if (substr($interstitial, $i, 1) eq
+	substr($ref_down, $i, 1)) {
+      $count_identical++;
+    } else {
+      # stop at first mismatch
+      last;
+    }
+  }
+  return $count_identical;
+}
+
+sub repeat_expansion_fz2 {
+  my $fai = get_fai();
+  my $chr = $FLAGS{chr} || die;
+  my $start = $FLAGS{start} || die;
+  my $end = $FLAGS{end} || die;
+  my $repeat = $FLAGS{repeat} || die;
+  my $count = $FLAGS{count} || die "-count";
+  # number of extra repeats to generate in pattern
+
+  my $flank = length($repeat) * $count;
+  printf STDERR "flanking sequence length: %d\n", $flank;
+  # this will influence conversion of long-read data to
+  # synthetic paired data when running fz2, as fz2 patterns
+  # must be longer than the input reads.
+
+  my $f_out = $FLAGS{out} || sprintf "repeat_expansion_%s_%d_%d_%s_%d.fz2.tab",
+    $chr, $start, $end, $repeat, $count;
+
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => [
+				       $F_PATTERN_ID,
+				       $F_PATTERN_SEQUENCE,
+				       "note",
+				      ],
+			 "-auto_qc" => 1,
+			);
+
+
+  my $chunk = $fai->get_chunk(
+			      "-id" => $chr,
+			      "-start" => $start,
+			      "-end" => $end
+			     );
+  die "specified repeat $repeat doesn't perfectly match target $chunk"
+    unless $chunk =~ /^($repeat)+$/i;
+
+  my $counter = 0;
+  my $get_id = sub {
+    return sprintf "expand-%s-%02d", $repeat, ++$counter;
+  };
+
+  #
+  #  pattern 1: upstream
+  #  - left side: upstream reference sequence, including reference repeat
+  #  - right side: generated repeats
+  #
+  #  TO DO: maybe put reference repeats with generated ones??
+
+  my $pos_right = $end;
+  my $pos_left = $end - ($flank - 1);
+
+  my $up = $fai->get_chunk(
+			   "-id" => $chr,
+			   "-start" => $pos_left,
+			   "-end" => $pos_right
+			  );
+  my $pattern = uc($up .
+    BREAKPOINT_FUSION_LEFT .
+      BREAKPOINT_FUSION_RIGHT .
+	$repeat x $count);
+
+  my %r;
+  $r{$F_PATTERN_ID} = &$get_id();
+  $r{$F_PATTERN_SEQUENCE} = $pattern;
+  $r{note} = "upstream";
+  $rpt->end_row(\%r);
+
+  #
+  #  pattern 1: downstream
+  #  - left side: generated repeats
+  #  - right side: downstream reference sequence, including reference repeat
+  #
+  $pos_left = $start;
+  $pos_right = $pos_left + ($flank - 1);
+  my $down = $fai->get_chunk(
+			   "-id" => $chr,
+			   "-start" => $pos_left,
+			   "-end" => $pos_right
+			  );
+  $pattern = uc(
+		$repeat x $count .
+		BREAKPOINT_FUSION_LEFT .
+		BREAKPOINT_FUSION_RIGHT .
+		$down
+	       );
+
+  %r = ();
+  $r{$F_PATTERN_ID} = &$get_id();
+  $r{$F_PATTERN_SEQUENCE} = $pattern;
+  $r{note} = "downstream";
+
+  $rpt->end_row(\%r);
+
+  $rpt->finish();
+}
+
+sub repeat_expansion_ref {
+  my $fai = get_fai();
+  my $chr = $FLAGS{chr} || die;
+  my $start = $FLAGS{start} || die;
+  my $end = $FLAGS{end} || die;
+  my $repeat = $FLAGS{repeat} || die;
+  my $flank = $FLAGS{flank} || die "-flank";
+
+  my @counts;
+  # number of extra repeats to generate in pattern
+  if (my $count = $FLAGS{count}) {
+    push @counts, $count;
+  } elsif (my $counts = $FLAGS{"count-list"}) {
+    push @counts, split /,/, $counts;
+  }
+  die "specify -count COUNT | -counts LIST" unless @counts;
+
+  my $f_out = $FLAGS{out} || sprintf "repeat_expansion_%s_%d_%d_%d_%s_%s.fa",
+    $chr, $start, $end, $flank, $repeat, join("_", @counts);
+
+  my $wf = new WorkingFile($f_out);
+  my $fh = $wf->output_filehandle();
+
+  my $chunk = $fai->get_chunk(
+			      "-id" => $chr,
+			      "-start" => $start,
+			      "-end" => $end
+			     );
+  die "specified repeat $repeat doesn't perfectly match target $chunk"
+    unless $chunk =~ /^($repeat)+$/i;
+
+  foreach my $count (@counts) {
+    my $pos_right = $end;
+    my $pos_left = $end - ($flank - 1);
+    # upstream reference sequence, including the reference repeat region
+
+    my $up = $fai->get_chunk(
+			     "-id" => $chr,
+			     "-start" => $pos_left,
+			     "-end" => $pos_right
+			    );
+
+    $pos_left = $end + 1;
+    $pos_right = $pos_left + ($flank - 1);
+    # downstream reference sequence, after the axreference repeat region
+
+    my $down = $fai->get_chunk(
+			       "-id" => $chr,
+			       "-start" => $pos_left,
+			       "-end" => $pos_right
+			      );
+
+    printf $fh ">%s_%d_%d_%s_%d\n%s%s%s\n",
+      $chr, $start, $end, $repeat, $count,
+	$up,
+	  $repeat x $count,
+	    $down;
+  }
+
+  $wf->finish();
+
+}
+
+sub repeat_expansion_whole {
+  # get reference list
+  # if ref matches, adjust, otherwise copy
+  my $fai = get_fai();
+  my $chr_wanted = $FLAGS{chr} || die;
+  my $start = $FLAGS{start} || die;
+  my $end = $FLAGS{end} || die;
+  my $repeat = $FLAGS{repeat} || die;
+  my $count = $FLAGS{count} || die "-count";
+
+  my $f_out = $FLAGS{out} || sprintf "repeat_expansion_%s_%d_%d_%s_%s.fa",
+    $chr_wanted, $start, $end, $repeat, $count;
+
+  #
+  #  verify repeat sequence in reference:
+  #
+  my $chunk = $fai->get_chunk(
+			      "-id" => $chr_wanted,
+			      "-start" => $start,
+			      "-end" => $end
+			     );
+  die "specified repeat $repeat doesn't perfectly match target $chunk"
+    unless $chunk =~ /^($repeat)+$/i;
+
+  my $wf = new WorkingFile($f_out);
+  my $fh = $wf->output_filehandle();
+  my $chrs = $fai->rnm->db_names_ordered();
+  my $rnm = new ReferenceNameMapper();
+  $rnm->add_name($chr_wanted);
+
+  my $found;
+  foreach my $chr (@{$chrs}) {
+    if ($rnm->find_name($chr)) {
+      #
+      # adjust this sequence to reflect repaet expansion
+      #
+      $found = 1;
+
+      my $seq_up = $fai->get_chunk(
+				   "-id" => $chr_wanted,
+				   "-start" => 1,
+				   "-end" => $end
+				  );
+      # upstream: start of reference through repeat region
+
+      my $seq_repeat = $repeat x $count;
+
+      my $irow = $fai->get_irow("-id" => $chr_wanted);
+      my $length = $irow->{sequence_length} || die;
+
+      my $seq_down = $fai->get_chunk(
+				   "-id" => $chr_wanted,
+				   "-start" => $end + 1,
+				   "-end" => $length
+				  );
+      printf $fh ">%s\n%s%s%s\n", $chr, lc($seq_up), uc($seq_repeat), lc($seq_down);
+    } else {
+      #
+      # other reference sequence: pass through
+      #
+      my $seq = $fai->get_sequence("-id" => $chr) || die;
+      printf $fh ">%s\n%s\n", $chr, $$seq;
+      # TO DO: preserve fasta ID line
+    }
+  }
+  $wf->finish();
+
+  build_fai($f_out);
+  # index fasta
+}
+
+sub detect_feature_edge {
+  # does the given query overlap feature occur at the edge of a feature,
+  # e.g. the boundary between one codon and the next?
+  my ($hi, $qo_start, $qo_end, $gbc) = @_;
+
+  my $hb_left = $hi->get_hit_base_for_query_base($qo_start);
+  my $hb_right = $hi->get_hit_base_for_query_base($qo_end) || die "can't get hit base for query base $qo_end";
+  # left and right boundaries of query overlap in RefSeq base space
+
+  my $feature_left = $gbc->get_feature_for_base_number($hb_left);
+  my $feature_right = $gbc->get_feature_for_base_number($hb_right);
+
+  my $verbose = 1;
+
+  if ($verbose) {
+    printf STDERR "features left: q=%d h=%d f=%s ",
+      $qo_start, $hb_left, $feature_left;
+
+    printf STDERR "features right: q=%d h=%d f=%s\n",
+      $qo_end, $hb_right, $feature_right;
+  }
+
+  my $is_edge = 0;
+
+  if ($feature_left eq $feature_right and $feature_left !~ /utr/i) {
+    # span covers a single feature.  Check exon boundaries only, not UTR
+    my ($hb_up, $hb_down) = sort {$a <=> $b} ($hb_left, $hb_right);
+    # hit bases might be on opposite strand from query
+    die "hey now, strand" if $hb_up != $hb_left;
+    # test: expected this might happen, find an example to confirm
+
+    my $f_up = $gbc->get_feature_for_base_number($hb_up - 1);
+    my $f_down = $gbc->get_feature_for_base_number($hb_down + 1);
+    printf STDERR "  neighbor features: %s, %s\n", $f_up, $f_down if $verbose;
+
+    $is_edge = 1 if $f_up ne $feature_left;
+    $is_edge = 1 if $f_down ne $feature_left;
+  }
+
+  #  die "X $qo_start $feature_left   $qo_end $feature_right";
+
+  return $is_edge;
+}
+
+sub microhomology_feature_edge_check {
+  my ($hi_left, $hi_right, $qo_start, $qo_end, $gbc) = @_;
+  # try various configurations of homomologous bases:
+  #   - assign all to A side
+  #   - assign all to B side
+  #   - if more than one base, assign combinations to A and B
+  # does one of these combinations yield a perfect exon edge mapping?
+
+  my $trimmed = 0;
+
+  if (detect_feature_edge($hi_left, $qo_start, $qo_end, $gbc)) {
+    # microhomology perfectly matches exon edge on A side,
+    # so keep that match and trim overlap from B side
+    # /research/rgs01/home/clusterHome/medmonso/work/steve/2020_06_13_cicero_contig_extension/2021_01_04_all/blast/ITD_refactor/test_microhomology_A.tab
+    if (0) {
+      printf STDERR "before:\n";
+      $hi_left->print_summary("left");
+      $hi_right->print_summary("right");
+
+      printf STDERR "  trim from R: %d-%d\n", $qo_start, $qo_end;
+      $hi_right->trim_query_region($qo_start, $qo_end);
+
+      printf STDERR "trimmed:\n";
+      $hi_left->print_summary("left");
+      $hi_right->print_summary("right");
+    }
+    $trimmed = "microhomology_exon_edge_A";
+  } elsif (detect_feature_edge($hi_right, $qo_start, $qo_end, $gbc)) {
+    # microhomology perfectly matches exon edge on B side.
+    # UNTESTED, need example to verify
+    if (1) {
+      printf STDERR "before:\n";
+      $hi_left->print_summary("left");
+      $hi_right->print_summary("right");
+
+      printf STDERR "  trim from L: %d-%d\n", $qo_start, $qo_end;
+      $hi_left->trim_query_region($qo_start, $qo_end);
+
+      printf STDERR "trimmed:\n";
+      $hi_left->print_summary("left");
+      $hi_right->print_summary("right");
+    }
+    die "untested";
+
+    $trimmed = "microhomology_exon_edge_B";
+  } elsif ($qo_start != $qo_end) {
+    # multi-base microhomology
+    my $len = ($qo_end - $qo_start) + 1;
+    my @range = ($qo_start .. $qo_end);
+    for (my $assign_left = 1; $assign_left < $len; $assign_left++) {
+#      printf STDERR "index: $assign_left\n";
+      my @left;
+      my @right;
+      for (my $i = 0; $i < @range; $i++) {
+	if ($i < $assign_left) {
+	  push @left, $range[$i];
+	} else {
+	  push @right, $range[$i];
+	}
+      }
+      my $is_l_edge = detect_feature_edge($hi_left,
+					  min(@left), max(@left),
+					  $gbc);
+      # check edge status for L portion
+      printf STDERR "$len $assign_left L=%s R=%s L_edge:%d\n",
+	join(",", @left), join(",", @right), $is_l_edge;
+      if ($is_l_edge) {
+	printf STDERR "before:\n";
+	$hi_left->print_summary("left");
+	$hi_right->print_summary("right");
+
+	printf STDERR "  trim from L: %s\n", join ",", @right;
+	printf STDERR "  trim from R: %s\n", join ",", @left;
+	$hi_left->trim_query_region($right[0], $right[$#right]);
+	$hi_right->trim_query_region($left[0], $left[$#left]);
+
+	printf STDERR "trimmed:\n";
+	$hi_left->print_summary("left");
+	$hi_right->print_summary("right");
+
+	$trimmed = "microhomology_exon_edge_split";
+	last;
+	# have to break out of loop, will fail if we continue because
+	# trimming has already taken place
+      }
+    }
+  }
+
+  return $trimmed;
+}
+
+sub filter_by_contig_identity {
+  # bucket rows by input_row_number and screen out results that have
+  # significantly less contig alignment than others, as these may
+  # reflect results for isoforms that sub-optionally match the contig.
+  # Don't want "interstitial" sequence in patterns to actually refer
+  # to a different reference isoform.
+  my %options = @_;
+  my $rows_in = $options{"-rows"} || die "-rows";
+  my $rpt_suppressed = $options{"-rpt-suppressed"} || die;
+#  my $f_key = "input_row_number";
+  # FAIL: invalid if data run through mux.pl
+  my $f_key = "input_row_md5";
+  # use a newer algorithm?
+
+  my %by_line;
+  my %keys;
+  my @keys;
+  foreach my $r (@{$rows_in}) {
+    unless (exists $r->{$f_key}) {
+      populate_md5sum($r, $options{"-df"} || die "-df");
+    }
+    my $key = $r->{$f_key} || confess "no field $f_key";
+    push @{$by_line{$key}}, $r;
+    push @keys, $key unless $keys{$key};
+    $keys{$key} = 1;
+  }
+
+  my $f_identity_frac = "__contig_identity_frac";
+
+  my @r_out;
+
+  foreach my $key (@keys) {
+    my $set = $by_line{$key};
+
+    foreach my $r (@{$set}) {
+      # foreach row in set, compute fraction identity between contig
+      # and isoform pair
+      my $si = new Set::IntSpan();
+
+      $si = si_merge_range($si, $r, "genea_contig_start", "genea_contig_end");
+      $si = si_merge_range($si, $r, "geneb_contig_start", "geneb_contig_end");
+      my $overlap_size = size $si;
+      my $contig = $r->{contig} || die;
+      $r->{$f_identity_frac} = $overlap_size / length($contig);
+#      printf STDERR "identity: %f\n", $r->{$f_identity_frac};
+    }
+
+    # find best identity fraction
+    my %fracs = map {$_, 1} map {$_->{$f_identity_frac}} @{$set};
+    my ($best_frac) = sort {$b <=> $a} keys %fracs;
+    my $cutoff = $best_frac * $FUSION_PREFER_BEST_CONTIG_MATCHES_BEST_RELATIVE_CUTOFF;
+
+    # filter rows based on cutoff:
+    foreach my $r (@{$set}) {
+      if ($r->{$f_identity_frac} >= $cutoff) {
+	# identity check passes, use for pattern generation
+	push @r_out, $r;
+      } else {
+	# reject row
+	$r->{$F_PATTERN_ID} = "";
+	# TO DO: also some kind of "note" field?
+	$rpt_suppressed->end_row($r);
+      }
+    }
+  }
+
+  return \@r_out;
+}
+
+sub si_merge_range {
+  my ($si, $r, $f1, $f2) = @_;
+  foreach ($f1, $f2) {
+    dump_die($r, "where is $_") unless exists $r->{$_};
+  }
+  my $start = $r->{$f1};
+  my $end = $r->{$f2};
+  if ($start and $end) {
+    if ($start <= $end) {
+      $si = union $si join "-", $start, $end;
+    } else {
+      printf STDERR "WARNING: suspicious start %d, end %d\n", $start, $end;
+      # buggy data??
+      $si = union $si join "-", $end, $start;
+    }
+  }
+  return $si;
+}
+
+sub find_interstitial_coding {
+  find_binary("blastn", "-die" => 1);
+  my $f_in = $FLAGS{patterns} || die "-patterns";
+  my $min_interstitial_length = 20;
+  # needs to be long enough to successfully blast
+  my $min_hsp_identity = 0.94;
+  # identity required for each HSP to be usable
+  my $min_coding_identity_hq = 0.95;
+  my $min_coding_identity_lq = 0.75;
+  my $genome = $FLAGS{genome} || die "-genome";
+  # needs to be specified for get_refflat
+
+  my $df = new DelimitedFile(
+			     "-file" => $f_in,
+			     "-headers" => 1,
+			    );
+  my $f_out = basename($f_in) . ".coding_interstitial.tab";
+  my $rpt_bad = $df->get_reporter("-file" => $f_out,
+				  "-extra" => [
+					       "ic_type",
+					       "ic_fraction",
+					       # ic = interstitial coding
+					      ]
+				 );
+  # only bad records included
+
+  my $gbc = new GenBankCache();
+  my $rf = get_refflat();
+  my $gsm = init_gsm($rf);
+
+  my $tfw = new TemporaryFileWrangler();
+  my $fa_query = $tfw->get_tempfile("-append" => ".query.fa");
+  my $fa_db = $tfw->get_tempfile("-append" => ".db.fa");
+  my $blast = get_blast();
+
+  my $pattern_restrict = $FLAGS{pattern};
+
+  my @pr;
+  my %all_accs;
+  while (my $row = $df->get_hash()) {
+    my $interstitial = get_interstitial($row->{sequence});
+    my $ilen = length($interstitial);
+    next unless $interstitial and $ilen >= $min_interstitial_length;
+    # checkable
+    next if $row->{fz2_hint} eq "no_condense";
+    # RK patterns, generated interstitial, never modify
+
+    push @pr, $row;
+
+    my $gene_a_list = $row->{genea_symbol} || die;
+    my $gene_b_list = $row->{geneb_symbol} || die;
+    foreach my $gene_list_raw ($gene_a_list, $gene_b_list) {
+      foreach my $gene (split /,/, $gene_list_raw) {
+	my $gene_rf = $gsm->find($gene);
+	if ($gene_rf) {
+	  my $rfs = $rf->find_by_gene($gene_rf);
+	  foreach my $rf (@{$rfs}) {
+	    my $acc = $rf->{name} || die;
+	    next unless $acc =~ /NM_/;
+	    # coding only
+	    $all_accs{$acc} = 1;
+	  }
+	} else {
+	  print STDERR "WARNING, can't find rfs for: $gene\n";
+	}
+      }
+    }
+  }
+
+  $gbc->get([sort keys %all_accs]);
+  # ensure all local copies of genbank records are available
+
+  my $c = new Counter(\@pr);
+  foreach my $row (@pr) {
+    my $gene_a_list = $row->{genea_symbol} || die;
+    my $gene_b_list = $row->{geneb_symbol} || die;
+    # pattern file format
+    next if $pattern_restrict and $row->{pattern} ne $pattern_restrict;
+
+    $c->next($row->{pattern});
+
+    my $interstitial = get_interstitial($row->{sequence});
+    my $ilen = length($interstitial);
+    if ($interstitial and $ilen >= $min_interstitial_length) {
+      open(QTMP, ">" . $fa_query) || die;
+      printf QTMP ">interstitial\n%s\n", $interstitial;
+      close QTMP;
+      # temp blast query file
+
+      my $has_bad_perfect;
+      my $has_bad_near_perfect;
+
+      my @all_genes;
+      foreach my $gene_list_raw ($gene_a_list, $gene_b_list) {
+	foreach my $gene (split /,/, $gene_list_raw) {
+	  push @all_genes, $gene;
+	}
+      }
+
+      my $si_query = new Set::IntSpan();
+
+      foreach my $gene_raw (@all_genes) {
+	my $gene_rf = $gsm->find($gene_raw) || die;
+	my $rfs = $rf->find_by_gene($gene_rf);
+	# ignore if blank, already warned above
+	foreach my $rf (@{$rfs}) {
+	  my $acc = $rf->{name} || die;
+	  next unless $acc =~ /NM_/;
+	  # coding only
+	  my $result_files = $gbc->get($acc);
+	  # should be cached already so OK to query one at a time
+	  die unless @{$result_files} == 1;
+	  my $gbc = new GenBankCDS("-file" => $result_files->[0]);
+	  my $info = $gbc->get_info();
+	  my $cds = $info->{mrna_cds} || die "no mrna_cds for $acc in " . $result_files->[0];
+	  # get coding sequence for transcript
+
+	  open(QTMP, ">" . $fa_db) || die;
+	  printf QTMP ">%s\n%s\n", $acc, $cds;
+	  close QTMP;
+	  # temp db file
+
+	  if (0) {
+	    print STDERR "DEBUG: saving query/db files\n";
+	    copy($fa_query, sprintf "debug_query.fa") || die;
+	    copy($fa_db, sprintf "debug_db_%s.fa", $acc) || die;
+	  }
+
+	  my @hsp = blast2hsps(
+			       "-blast" => $blast,
+			       "-query" => $fa_query,
+			       "-database" => $fa_db
+			      );
+
+	  foreach my $hsp (@hsp) {
+	    my $ni = $hsp->num_identical();
+	    next unless $hsp->frac_identical("query") >= $min_hsp_identity;
+#	    printf STDERR "debug q range: %d-%d\n", $hsp->range("query");
+	    $si_query = union $si_query join("-", $hsp->range("query"));
+	    # add query range covered by this HSP to tracker.
+	    # may include more than one gene, e.g. CACUL1-RFWD2-01
+	  }
+	}
+      }
+
+      my $q_coverage = size $si_query;
+      my $match_frac = $q_coverage / $ilen;
+      # coverage of interstitial sequence vs. either gene
+
+      my $ic_type = "";
+      if ($match_frac == 1) {
+	$ic_type = "perfect";
+      } elsif ($match_frac >= $min_coding_identity_hq) {
+	$ic_type = "HQ";
+      } elsif ($match_frac >= $min_coding_identity_lq) {
+	$ic_type = "LQ";
+      }
+      if ($ic_type) {
+	$row->{ic_type} = $ic_type;
+	$row->{ic_fraction} = $match_frac;
+	$rpt_bad->end_row($row);
+      }
+    }
+  }
+  $rpt_bad->finish();
+
+}
+
+sub get_interstitial {
+  my ($seq) = @_;
+  my $interstitial = "";
+#  if ($seq =~ /[\]\}](\w+)[\[\{]/) {
+  if ($seq =~ /[\]\}](\w*)[\[\{]/) {
+    $interstitial = $1;
+  } else {
+    die "no pattern breakpoint found";
+  }
+  return $interstitial;
+}
+
+sub populate_md5sum {
+  my ($row, $df) = @_;
+  $row->{input_row_md5} = md5_hex(map {$row->{$_}} @{$df->headers_raw});
+}
+
+sub patch_features {
+  my $f_patterns = $FLAGS{"patterns"} || die "-patterns";
+  my $f_out = basename($f_patterns) . ".patch_features.tab";
+  my $restrict_source = $FLAGS{"restrict-source"};
+
+  #
+  # pass 1: get transcript accessions for cache
+  #
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			    );
+  my %all_accs;
+  while (my $row = $df->get_hash()) {
+    my $pattern = $row->{sequence} || die;
+    next if $restrict_source and $row->{source} ne $restrict_source;
+    foreach my $side (qw(a b)) {
+      my $f_acc = sprintf 'gene%s_acc', $side;
+      my $acc_list = $row->{$f_acc} || dump_die($row, "no value for $f_acc");
+      my @accs = split /,/, $acc_list;
+      foreach my $acc (@accs) {
+	$all_accs{$acc} = 1;
+      }
+    }
+  }
+
+  my $gbc = new GenBankCache();
+
+  $gbc->get([sort keys %all_accs]) unless $FLAGS{"no-genbank-cache-check"};
+
+  # pass 2: process
+  $df = new DelimitedFile("-file" => $f_patterns,
+			  "-headers" => 1,
+			 );
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  my $chunk_size = 80;
+  # PROSC-C22orf43-01: requires 77 to not have chunk be duplicated
+
+#  my $chunk_size = 5000;
+  # TTN requires entire upstream pattern to anchor uniquely
+
+  while (my $row = $df->get_hash()) {
+    my $can_process = 1;
+
+    $can_process = 0 if $restrict_source and $row->{source} ne $restrict_source;
+
+    if ($can_process) {
+      my $pattern = $row->{sequence} || die;
+      foreach my $side (qw(a b)) {
+	my $f_feature = sprintf 'gene%s_feature', $side;
+	my $f_acc = sprintf 'gene%s_acc', $side;
+	unless ($row->{$f_feature}) {
+	  # needs to be populated
+	  my $chunk;
+	  my $chunk_all;
+	  if ($side eq "a") {
+	    if ($pattern =~ /(.{$chunk_size})[\]\}]/) {
+	      $chunk = $1;
+	    }
+	    $pattern =~ /^(.+)[\]\}]/ || die;
+	    # full side of the pattern, maybe be longer or shorter
+	    # than the target chunk size.
+	    # shorter example: AKAP8-SUGP2-01
+	    $chunk_all = $1;
+	  } elsif ($side eq "b") {
+	    if ($pattern =~ /[\[\{](.{$chunk_size})/) {
+	      $chunk = $1;
+	    }
+	    $pattern =~ /[\[\{](.*)$/ || die;
+	    $chunk_all = $1;
+	  } else {
+	    die;
+	  }
+
+	  my $acc_list = $row->{$f_acc} || die;
+	  my @accs = split /,/, $acc_list;
+	  my %features;
+	  foreach my $acc (@accs) {
+	    my $type = $side eq "a" ? "downstream" : "upstream";
+	    my $feature = get_feature_for_chunk($gbc, $acc, $chunk, $chunk_all, $type);
+	    $features{$feature} = 1;
+	  }
+
+	  $row->{$f_feature} = join ",", sort keys %features;
+	}
+      }
+    }
+
+    $rpt->end_row($row);
+  }
+
+  $rpt->finish();
+}
+
+
+sub get_feature_for_chunk {
+  # TO DO: "fuzzy" or "voting" version that searches annots for entire chunk
+  my ($gb_cache, $acc, $chunk_small, $chunk_all, $edge) = @_;
+  my $f_gb = $gb_cache->get($acc)->[0] || die;
+  my $gbc = new GenBankCDS("-file" => $f_gb);
+  my $info = $gbc->get_info();
+  my $mrna_full = $info->{mrna_full} || die "no mrna_cds for $acc";
+
+  my $idx;
+  my $chunk;
+  foreach my $try (grep {$_} $chunk_small, $chunk_all) {
+    # small chunk might not be defined (smaller-than-chunk-size
+    # sequence at start or end of pattern)
+    my $i = index($mrna_full, $try);
+    die "can't find $try in $acc $mrna_full" if $i == -1;
+    my $i2 = index($mrna_full, $try, $i + 1);
+    if ($i2 == -1) {
+      # if chunk sequence is unique in mrna sequence
+      $chunk = $try;
+      $idx = $i;
+      last;
+    }
+  }
+  die unless $chunk;
+
+  my $fuzzy_codon = $FLAGS{"fuzzy-codon"};
+  die "-fuzzy-codon" unless defined $fuzzy_codon;
+
+  my $result;
+  if ($fuzzy_codon) {
+    #
+    # consider the breakpoint base plus 2 additional nt beyond
+    # the breakpoint (upstream on 5' end, downstream on 3'),
+    # and use the most frequently-occurring annotation.
+    #
+    # Helpful for small breakpoint imperfections due to microhomology
+    # or split codons, e.g. RK pattern A2ML1-RBM39-01
+    #
+    my ($base_number_start, $base_number_end);
+    if ($edge eq "downstream") {
+      # chunk is before breakpoint, so get annotations from last base
+      # number
+      $base_number_end = $idx + length($chunk);
+      $base_number_start = $base_number_end - 2;
+    } else {
+      # chunk immediately follows breakpoint, so use first base
+      $base_number_start = $idx + 1;
+      $base_number_end = $base_number_start + 2;
+    }
+
+    my %annot;
+    for (my $i = $base_number_start; $i <= $base_number_end; $i++) {
+      my $feature = $gbc->get_feature_for_base_number($i);
+      $annot{$feature}++;
+    }
+
+    ($result) = sort {$annot{$b} <=> $annot{$a}} keys %annot;
+#    dump_die(\%annot, $result) if scalar keys %annot > 1;
+  } else {
+    #
+    # annotate on the breakpoint base only:
+    #
+    my $base_number;
+    if ($edge eq "downstream") {
+      # chunk is before breakpoint, so get annotations from last base
+      # number
+      $base_number = $idx + length($chunk);
+    } else {
+      # chunk immediately follows breakpoint, so use first base
+      $base_number = $idx + 1;
+    }
+    printf STDERR "acc %s side %s: base number %d mrna: %s\n", $acc, $edge, $base_number, $mrna_full;
+    $result = $gbc->get_feature_for_base_number($base_number);
+  }
+  return $result;
+}
+
+sub detect_needed_headers {
+  my ($df, $headers) = @_;
+  my %h_existing = map {$_, 1} @{$df->headers_raw};
+  my @h_needed = grep {!$h_existing{$_}} @{$headers};
+  # only add headers if they are not already present, e.g.
+  # when refreshing incomplete annotations
+  return \@h_needed;
+}
+
+sub patch_gene_pair_summary {
+  # patch records missing gene_pair_summary field.
+  # requires all (non-merged) summary annotations.
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  my $f_out = basename($f_patterns) . ".gps.tab";
+
+  my %rescue_acc2symbol;
+  $rescue_acc2symbol{"NM_001291398.2"} = "FAM21A";
+  $rescue_acc2symbol{"NM_001367397.1"} = "FAM21C";
+  $rescue_acc2symbol{"NM_001023567.5"} = "GOLGA8B";
+  $rescue_acc2symbol{"NM_001368072.2"} = "GOLGA8A";
+
+  # HACK:
+  # hardcode lookups between genes and accessions,
+  # because (A) there are only currently a few exceptions and
+  # (B) gene symbols in the GenBank records may be newer than
+  # the symbols we're processing, e.g. FAM21A --> WASHC2A
+  #
+
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  my $f_gps = "gene_pair_summary";
+
+  my @pair_elements = qw(
+		     symbol
+		     acc
+		     feature
+		   );
+  while (my $row = $df->get_hash()) {
+    unless ($row->{$f_gps}) {
+      # patch needed
+      my %pair_side;
+      foreach my $side (qw(a b)) {
+	my %elements;
+	foreach my $element (@pair_elements) {
+	  my $f = sprintf 'gene%s_%s', $side, $element;
+	  my $v = $row->{$f} || dump_die($row, "no $f");
+	  $elements{$element} = $v;
+	}
+	my $key = join "/", map {$elements{$_}} @pair_elements;
+	if ($key =~ /,/) {
+	  # merged record containing lists
+	  printf STDERR "list detected for %s: %s\n", $row->{pattern}, $key;
+	  my %has_list;
+	  foreach my $e (@pair_elements) {
+	    $has_list{$e} = $elements{$e} =~ /,/ ? 1 : 0;
+	  }
+
+	  if ($has_list{symbol} and $has_list{acc} and !$has_list{feature}) {
+	    # multiple gene symbols/accessions, but feature is the same
+	    my $feature = $elements{feature};
+	    # fixed
+	    my %acc = map {$_, 1} split /,/, $elements{acc};
+	    my %symbol = map {$_, 1} split /,/, $elements{symbol};
+
+	    foreach my $acc (sort keys %acc) {
+	      my $sym = $rescue_acc2symbol{$acc} || die "no gene symbol for $acc in " . $row->{pattern};
+	      die unless $symbol{$sym};
+	      delete $symbol{$sym};
+	      $key = join "/", $sym, $acc, $feature;
+	      push @{$pair_side{$side}}, $key;
+	    }
+	    die "leftover data" if %symbol;
+	  } else {
+	    die "unhandled disambiguation case";
+	  }
+	} else {
+	  # single record
+	  push @{$pair_side{$side}}, $key;
+	}
+      }
+
+      my @combinations;
+
+      foreach my $pair_a (@{$pair_side{"a"}}) {
+	foreach my $pair_b (@{$pair_side{"b"}}) {
+	  # at this point, lists are expected to have been
+	  # split into separate entries
+	  my $pair = join "-", $pair_a, $pair_b;
+	  if ($pair =~ /,/) {
+	    printf STDERR "ERROR: %s: summary %s contains lists!\n", $row->{pattern}, $pair;
+	    die "unhandled";
+	  }
+	  push @combinations, $pair;
+	}
+      }
+
+      my $summary = join ",", @combinations;
+      $row->{$f_gps} = $summary;
+    }
+
+    $rpt->end_row($row);
+  }
+  $rpt->finish();
+}
+
+sub patch_gene_pair {
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  my $f_out = basename($f_patterns) . ".gene_pair.tab";
+
+  my @h_new = ( $F_GENE_PAIR );
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $h_needed = detect_needed_headers($df, \@h_new);
+
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+			      "-extra" => $h_needed,
+  			      "-auto_qc" => 1,
+			     );
+
+  while (my $row = $df->get_hash()) {
+    my $pid = $row->{pattern};
+    my $pair = pid2pair($pid);
+    $row->{$F_GENE_PAIR} = $pair;
+    $rpt->end_row($row);
+  }
+  $rpt->finish();
+
+}
+
+sub pid2pair {
+  my ($pid) = @_;
+  my $gene_pair = $pid;
+  $gene_pair =~ s/\-\d+$// || die;
+  return $gene_pair;
 }

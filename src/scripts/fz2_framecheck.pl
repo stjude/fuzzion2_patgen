@@ -57,6 +57,7 @@ use constant FRAME_EXCEPTION_POSSIBLE_NON_CODING_UTR_3 => "possible_utr3";
 # 5' or 3' UTR annotation
 use constant FRAME_EXCEPTION_POSSIBLE_NON_CODING_OTHER => "possible_noncoding_feature";
 use constant FRAME_EXCEPTION_PROTEIN_TRANSLATION_EXCEPTION => "protein_translation_exception";
+use constant FRAME_EXCEPTION_MISSING_ACCESSIONS => "missing_transcript_accessions";
 # e.g. NM_002537.3, standard protein translation doesn't work
 
 my $VERBOSE;
@@ -289,7 +290,16 @@ while (my $row = $df->get_hash()) {
 
   my $nm_a = get_transcript($row, "a");
   my $nm_b = get_transcript($row, "b");
-  if ($nm_a =~ /^NR_/ or $nm_b =~ /^NR_/) {
+
+  if (not($nm_a and $nm_b)) {
+    foreach (@h_new) {
+      $row->{$_} = "";
+    }
+    $row->{$F_CALL} = FRAME_CALL_UNKNOWN;
+    $row->{$F_EXCEPTION} = FRAME_EXCEPTION_MISSING_ACCESSIONS;
+    $rpt->end_row($row);
+    next;
+  } elsif ($nm_a =~ /^NR_/ or $nm_b =~ /^NR_/) {
     foreach (@h_new) {
       $row->{$_} = "";
     }
@@ -642,36 +652,41 @@ sub get_exon_info {
 sub get_transcript {
   my ($row, $which) = @_;
   my $f = sprintf "gene%s_acc", $which;
-  my @set = split /,/, ($row->{$f} || die);
-  if (@set > 1 and $PREFER_SJPI) {
-    my @pref;
-    foreach my $nm (@set) {
-      push @pref, $nm if $sjpi->is_preferred_nm($nm);
-    }
-    if (@pref and @pref == 1) {
-      @set = @pref;
-    } else {
-      # preferred isoform not available, use highest-ranking instead
-      my %rank2nm;
+  my $result;
+  if (my $acc_list = $row->{$f}) {
+    my @set = split /,/, $acc_list;
+    if (@set > 1 and $PREFER_SJPI) {
+      my @pref;
       foreach my $nm (@set) {
-	my $rank = $sjpi->get_nm_rank($nm);
-	unless ($rank) {
-	  if ($nm =~ /^NM_/) {
-	    # coding refseq
-	    $rank = 1000;
-	  } else {
-	    $rank = 2000;
-	    # NR_ / NG_ etc.
-	  }
-	}
-	push @{$rank2nm{$rank}}, $nm;
+	push @pref, $nm if $sjpi->is_preferred_nm($nm);
       }
-      my @ranks = sort {$a <=> $b} keys %rank2nm;
-      my $best_rank = $ranks[0];
-      @set = $rank2nm{$best_rank}->[0];
+      if (@pref and @pref == 1) {
+	@set = @pref;
+      } else {
+	# preferred isoform not available, use highest-ranking instead
+	my %rank2nm;
+	foreach my $nm (@set) {
+	  my $rank = $sjpi->get_nm_rank($nm);
+	  unless ($rank) {
+	    if ($nm =~ /^NM_/) {
+	      # coding refseq
+	      $rank = 1000;
+	    } else {
+	      $rank = 2000;
+	      # NR_ / NG_ etc.
+	    }
+	  }
+	  push @{$rank2nm{$rank}}, $nm;
+	}
+	my @ranks = sort {$a <=> $b} keys %rank2nm;
+	my $best_rank = $ranks[0];
+	@set = $rank2nm{$best_rank}->[0];
+      }
     }
+    $result = $set[0];
   }
-  return $set[0];
+
+  return $result;
 }
 
 
@@ -1093,7 +1108,7 @@ sub build_genbank_cache {
   while (my $row = $df->get_hash()) {
     foreach my $end (qw(a b)) {
       my $nm = get_transcript($row, $end);
-      $all_nm{$nm} = 1;
+      $all_nm{$nm} = 1 if $nm;
     }
   }
   $gbc->get([ sort keys %all_nm ]);
@@ -1328,7 +1343,5 @@ sub prune_hits {
 	}
       }
     }
-
   }
-
 }
