@@ -1,69 +1,50 @@
-<p align="center">
+# fuzzion2_patterns
 
-  <h1 align="center">
-    [PROJECT NAME]
-  </h1>
+This documentation is under construction.  
 
-  <p align="center">
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template" target="_blank">
-     <img alt="Status"
-          src="https://img.shields.io/badge/status-active-success.svg" />
-   </a>
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/issues" target="_blank">
-     <img alt="Github Issues"
-          src="https://img.shields.io/github/issues/stjudecloud/bioinformatics-tool-template"  />
-   </a>
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/pulls"  target="_blank">
-     <img alt="Pull Requests"
-          src="https://img.shields.io/github/issues-pr/stjudecloud/bioinformatics-tool-template"  />
-   </a>
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/blob/main/LICENSE.md" target="_blank">
-     <img alt="License: MIT"
-          src="https://img.shields.io/badge/License-MIT-blue.svg" />
-   </a>
-  </p>
+This code generates patterns for [Fuzzion2](https://www.github.com/stjude/fuzzion2/).  It can produce patterns for:
 
+| sequencing type | event type | input |
+| ---------- | ----- | ----- |
+| RNA | fusion | sequence contig |
+| RNA | fusion | genomic breakpoints |
+| RNA | ITD/intragenic  | sequence contig |
+| DNA | fusion | genomic breakpoints |
 
-  <p align="center">
-   [PROVIDE A HIGH LEVEL DESCRIPTION OF YOUR PROJECT] 
-   <br />
-   <a href="#"><strong>Explore the docs »</strong></a>
-   <br />
-   <a href="#"><strong>Read the paper »</strong></a>
-   <br />
-   <br />
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/issues/new?assignees=&labels=&template=feature_request.md&title=Descriptive%20Title&labels=enhancement">Request Feature</a>
-    | 
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/issues/new?assignees=&labels=&template=bug_report.md&title=Descriptive%20Title&labels=bug">Report Bug</a>
-   <br />
-    ⭐ Consider starring the repo! ⭐
-   <br />
-  </p>
-</p>
+## Setup
 
----
-## Quick Start
-How can a user get the project up and running in the shortest amount of time? Docker is a good tool for this if the project supports it.
+Change to a directory where you want to keep the code, which will be referred to by $INSTALL_DIR below.
 
-### Docker
-Example deployment if project supports Docker.
+This command will retrieve a copy of the code and put it in a new "fuzzion2_patterns" subdirectory:
+```
+git clone https://github.com/stjude/fuzzion2_patterns.git
+```
 
-### Developers Build
-Example of how to manually build the project
+add the scripts directory to your PATH, and the Perl library directory to your PERL5LIB:
+```
+export PATH=$INSTALL_DIR/fuzzion2_patterns/src/scripts:$PATH
+export PERL5LIB=$INSTALL_DIR/fuzzion2_patterns/src/perllib:$PERL5LIB
+```
+
 
 #### Dependencies
-List external dependencies here that the install process assumes are installed prior to beginning.
 
-## Usage 
-Explain how to use the tool here.  Dive into the subcommands and optional flags.  Give examples of the tool running and what a successful execution might look like.
+* Perl (version 5.10.1 or later)
+* The following third-party Perl modules are required (this list likely needs work):
+  * Set::IntSpan
+  * LWP
+  * Data::Compare
+* BLAST (specifically the "blastn" executable), which must be available on your PATH
 
-### Contact
-Provide contact information if the author of the code chooses to.  Issues are another effective way of communication as well.
 
-#### Limitations
-Are there any know limits to the tool.  Some examples of this might be:
-  - Does not run on OSX
-  - Version 1.2 of library XYZ causes `this` unexpected behavior
----
-#### COPYRIGHT 
-Provide St Jude Copyright information here.  Make sure to update the year.
+#### Installation test
+
+To verify that the Perl code is runnable, execute the following command:
+```
+perl -cw `which fusion_contig_extension.pl`
+```
+
+This should return a message saying "syntax OK".  If error messages appear, please report them to us (see Contact section).  A common reason for errors is one or more third-party Perl modules missing from in your installation.
+
+## Contact
+Please contact Michael Edmonson <michael.edmonson@stjude.org> for assistance with this code.
