@@ -60,13 +60,16 @@
     <div id="toc-collapse" class="navbar-collapse collapse card bg-body-tertiary">
         <ul class="nav flex-column">
             
-            <li class="nav-item" data-bs-level="2"><a href="#quick-start" class="nav-link">Quick Start</a>
+            <li class="nav-item" data-bs-level="1"><a href="#fuzzion2_patterns" class="nav-link">fuzzion2_patterns</a>
+              <ul class="nav flex-column">
+            <li class="nav-item" data-bs-level="2"><a href="#setup" class="nav-link">Setup</a>
               <ul class="nav flex-column">
               </ul>
             </li>
-            
-            <li class="nav-item" data-bs-level="2"><a href="#usage" class="nav-link">Usage</a>
+            <li class="nav-item" data-bs-level="2"><a href="#contact" class="nav-link">Contact</a>
               <ul class="nav flex-column">
+              </ul>
+            </li>
               </ul>
             </li>
         </ul>
@@ -74,69 +77,65 @@
 </div></div>
                     <div class="col-md-9" role="main">
 
-<p align="center">
-
-  <h1 align="center">
-    [PROJECT NAME]
-  </h1>
-
-  <p align="center">
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template" target="_blank">
-     <img alt="Status"
-          src="https://img.shields.io/badge/status-active-success.svg" />
-   </a>
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/issues" target="_blank">
-     <img alt="Github Issues"
-          src="https://img.shields.io/github/issues/stjudecloud/bioinformatics-tool-template"  />
-   </a>
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/pulls"  target="_blank">
-     <img alt="Pull Requests"
-          src="https://img.shields.io/github/issues-pr/stjudecloud/bioinformatics-tool-template"  />
-   </a>
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/blob/main/LICENSE.md" target="_blank">
-     <img alt="License: MIT"
-          src="https://img.shields.io/badge/License-MIT-blue.svg" />
-   </a>
-  </p>
-
-
-  <p align="center">
-   [PROVIDE A HIGH LEVEL DESCRIPTION OF YOUR PROJECT] 
-   <br />
-   <a href="#"><strong>Explore the docs »</strong></a>
-   <br />
-   <a href="#"><strong>Read the paper »</strong></a>
-   <br />
-   <br />
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/issues/new?assignees=&labels=&template=feature_request.md&title=Descriptive%20Title&labels=enhancement">Request Feature</a>
-    | 
-   <a href="https://github.com/stjudecloud/bioinformatics-tool-template/issues/new?assignees=&labels=&template=bug_report.md&title=Descriptive%20Title&labels=bug">Report Bug</a>
-   <br />
-    ⭐ Consider starring the repo! ⭐
-   <br />
-  </p>
-</p>
-
-<hr />
-<h2 id="quick-start">Quick Start</h2>
-<p>How can a user get the project up and running in the shortest amount of time? Docker is a good tool for this if the project supports it.</p>
-<h3 id="docker">Docker</h3>
-<p>Example deployment if project supports Docker.</p>
-<h3 id="developers-build">Developers Build</h3>
-<p>Example of how to manually build the project</p>
+<h1 id="fuzzion2_patterns">fuzzion2_patterns</h1>
+<p>This documentation is under construction.  </p>
+<p>This code generates patterns for <a href="https://www.github.com/stjude/fuzzion2/">Fuzzion2</a>.  It can produce patterns for:</p>
+<table>
+<thead>
+<tr>
+<th>sequencing type</th>
+<th>event type</th>
+<th>input</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RNA</td>
+<td>fusion</td>
+<td>sequence contig</td>
+</tr>
+<tr>
+<td>RNA</td>
+<td>fusion</td>
+<td>genomic breakpoints</td>
+</tr>
+<tr>
+<td>RNA</td>
+<td>ITD/intragenic</td>
+<td>sequence contig</td>
+</tr>
+<tr>
+<td>DNA</td>
+<td>fusion</td>
+<td>genomic breakpoints</td>
+</tr>
+</tbody>
+</table>
+<h2 id="setup">Setup</h2>
+<p>Change to a directory where you want to keep the code, which will be referred to by $INSTALL_DIR below.</p>
+<p>This command will retrieve a copy of the code and put it in a new "fuzzion2_patterns" subdirectory:</p>
+<pre><code>git clone https://github.com/stjude/fuzzion2_patterns.git
+</code></pre>
+<p>add the scripts directory to your PATH, and the Perl library directory to your PERL5LIB:</p>
+<pre><code>export PATH=$INSTALL_DIR/fuzzion2_patterns/src/scripts:$PATH
+export PERL5LIB=$INSTALL_DIR/fuzzion2_patterns/src/perllib:$PERL5LIB
+</code></pre>
 <h4 id="dependencies">Dependencies</h4>
-<p>List external dependencies here that the install process assumes are installed prior to beginning.</p>
-<h2 id="usage">Usage</h2>
-<p>Explain how to use the tool here.  Dive into the subcommands and optional flags.  Give examples of the tool running and what a successful execution might look like.</p>
-<h3 id="contact">Contact</h3>
-<p>Provide contact information if the author of the code chooses to.  Issues are another effective way of communication as well.</p>
-<h4 id="limitations">Limitations</h4>
-<p>Are there any know limits to the tool.  Some examples of this might be:
-  - Does not run on OSX
-  - Version 1.2 of library XYZ causes <code>this</code> unexpected behavior</p>
-<hr />
-<h4 id="copyright">COPYRIGHT</h4>
-<p>Provide St Jude Copyright information here.  Make sure to update the year.</p></div>
+<ul>
+<li>Perl (version 5.10.1 or later)</li>
+<li>The following third-party Perl modules are required (this list likely needs work):</li>
+<li>Set::IntSpan</li>
+<li>LWP</li>
+<li>Data::Compare</li>
+<li>BLAST (specifically the "blastn" executable), which must be available on your PATH</li>
+</ul>
+<h4 id="installation-test">Installation test</h4>
+<p>To verify that the Perl code is runnable, execute the following command:</p>
+<pre><code>perl -cw `which fusion_contig_extension.pl`
+</code></pre>
+<p>This should return a message saying "syntax OK".  If error messages appear, please report them to us (see Contact section).  A common reason for errors is one or more third-party Perl modules missing from in your installation.</p>
+<h2 id="contact">Contact</h2>
+<p>Please contact Michael Edmonson <a href="&#109;&#97;&#105;&#108;&#116;&#111;&#58;&#109;&#105;&#99;&#104;&#97;&#101;&#108;&#46;&#101;&#100;&#109;&#111;&#110;&#115;&#111;&#110;&#64;&#115;&#116;&#106;&#117;&#100;&#101;&#46;&#111;&#114;&#103;">&#109;&#105;&#99;&#104;&#97;&#101;&#108;&#46;&#101;&#100;&#109;&#111;&#110;&#115;&#111;&#110;&#64;&#115;&#116;&#106;&#117;&#100;&#101;&#46;&#111;&#114;&#103;</a> for assistance with this code.</p></div>
             </div>
         </div>
 
@@ -219,5 +218,5 @@
 
 <!--
 MkDocs version : 1.6.1
-Build Date UTC : 2025-02-05 18:02:30.577110+00:00
+Build Date UTC : 2025-02-06 17:45:22.959174+00:00
 -->
