@@ -4714,7 +4714,7 @@ sub generate_rna_contigs {
   # from e.g. ProteinPaint RNA coordinates
   #
   my $infile = $FLAGS{file} || die "-file";
-  init_sjpi();
+  init_sjpi() if $REPORT_SJPI;
   my $df = new DelimitedFile(
 			     "-file" => $infile,
 			     "-headers" => 1,
