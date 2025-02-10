@@ -55,7 +55,7 @@ The examples below show how to generate fuzzion2 patterns targeting different ev
 
 ## Example: RNA fusion pattern from contig sequence
 
-The directory test/rna_fusion_contig has example scripts to generate fuzzion2 patterns from an example input file.  Output files are also provided.  The scripts are:
+The directory test/rna_fusion_contig contains scripts to generate fuzzion2 patterns from the example input file example.tsv.  Output files are also provided.  The scripts are:
 
 ```
 step1_cicero_no_config.sh
@@ -64,6 +64,14 @@ step1_cicero_no_config.sh
 # modify "-fasta GRCh37-lite.fa" to point to your genome FASTA file
 step2_convert.sh
 # processes intermediate file to yield fuzzion2 pattern file (example.tsv.extended.tab.fuzzion_extended_500.tab)
+```
+## Example: RNA fusion pattern from genomic coordinates
+
+The directory test/rna_fusion_coordinates is similar to the previous example, but example.tsv specifies genomic breakpoints of the fusion.
+```
+step1_rna_no_config.sh
+# modify "-refflat ncbiRefSeq.txt" to point to your ncbiRefSeq.txt file
+step2_convert.sh
 ```
 
 ## Contact
