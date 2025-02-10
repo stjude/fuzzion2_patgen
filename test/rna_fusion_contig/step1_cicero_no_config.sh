@@ -1,1 +1,1 @@
-fusion_contig_extension.pl -file example.tsv -refflat ncbiRefSeq.txt -cicero -no-blacklist -report-sjpi 0 -fasta GRCh37-lite.fa -genome GRCh37-lite $*
+fusion_contig_extension.pl -file example.tsv -refflat ncbiRefSeq.txt -cicero -no-blacklist -report-sjpi 0 -fasta /research_jude/rgs01_jude/resgen/dev/tartan/runs/ad_hoc/RevertFASTARefs-DKSkI6SE/output/FASTA/GRCh37-lite.fa -genome GRCh37-lite -hgnc hgnc_complete_set.txt $*
