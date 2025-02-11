@@ -78,5 +78,18 @@ step1_rna_no_config.sh
 step2_convert.sh
 ```
 
+## Example: RNA ITD or intragenic event pattern from contig sequence
+
+The directory test/rna_intragenic contains an example of generating a pattern from a provided FLT3 ITD contig sequence.  This code generates a fuzzion2 pattern file directly rather than via an intermediate file.
+```
+step1_intragenic_no_config.sh
+# modify "-refflat ncbiRefSeq.txt" to point to your local copy
+# modify "-hgnc hgnc_complete_set.txt" to point to your copy
+```
+
+## Example: DNA fusion pattern from genomic coordinates
+
+(coming soon)
+
 ## Contact
 Please contact Michael Edmonson <michael.edmonson@stjude.org> for assistance with this code.
