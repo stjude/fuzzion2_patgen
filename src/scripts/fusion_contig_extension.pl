@@ -10623,6 +10623,10 @@ sub itd2fuzzion {
   my ($rf, $f_refflat);
   if ($cicero_mode) {
     $rf = get_refflat() || die;
+    init_gsm($rf);
+    # do this now so potential command-line HGNC is used.
+    # otherwise it may be invoked later by RefFlatFile which doesn't
+    # know about local option
   }
 
   printf STDERR "configuration:\n";
@@ -11113,6 +11117,7 @@ sub itd2fuzzion {
 	  $r->{$f} =~ s/^chr//i;
 	}
       }
+      populate_gene_pair($r);
       generate_pair_summary($r);
       $rpt->end_row($r);
     }
