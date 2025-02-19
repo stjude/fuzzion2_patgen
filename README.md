@@ -89,7 +89,15 @@ step1_intragenic_no_config.sh
 
 ## Example: DNA fusion pattern from genomic coordinates
 
-(coming soon)
+The directory test/dna_fusion_coordinates contains an example of generating a DNA pattern from provided breakpoint coordinate and strand information (see "test.tsv"). 
+
+```
+step1_genomic_no_config.sh
+# modify "-refflat ncbiRefSeq.txt" to point to your local copy
+# modify "-fasta GRCh37-lite.fa" to point to your local copy
+step2_convert.sh
+```
+
 
 ## Contact
 Please contact Michael Edmonson <michael.edmonson@stjude.org> for assistance with this code.
