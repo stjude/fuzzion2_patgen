@@ -169,6 +169,8 @@ my @clopts = (
 	      "-blast-min-score-frame=i" => \$BLAST_MIN_SCORE_FRAME,
 
 	      "-build-genbank-cache",
+	      "-cache-only",
+
 	      "-trim-hsp=i" => \$TRIM_HSP,
 
 	      "-trim-patterns-to-flanking=i",
@@ -219,7 +221,7 @@ my $gbc = new GenBankCache();
 
 if ($FLAGS{"build-genbank-cache"}) {
   build_genbank_cache();
-  exit(0);
+  exit(0) if $FLAGS{"cache-only"};
 }
 
 
@@ -251,9 +253,11 @@ my @h_new = (
 		 frame_notes
 	      ));
 
+my $h_needed = detect_needed_headers($df, \@h_new);
+
 my $rpt = $df->get_reporter(
 			    "-file" => $f_out,
-			    "-extra" => \@h_new,
+			    "-extra" => $h_needed,
 			    "-auto_qc" => 1,
 			   );
 
@@ -1348,4 +1352,13 @@ sub prune_hits {
       }
     }
   }
+}
+
+sub detect_needed_headers {
+  my ($df, $headers) = @_;
+  my %h_existing = map {$_, 1} @{$df->headers_raw};
+  my @h_needed = grep {!$h_existing{$_}} @{$headers};
+  # only add headers if they are not already present, e.g.
+  # when refreshing incomplete annotations
+  return \@h_needed;
 }

@@ -23,6 +23,7 @@ use SJPreferredIsoform;
 use TdtConfig;
 use RefFlatFile;
 use Fuzzion2Fuzzall;
+use Fuzzion2Hits;
 use ReferenceNameMapper;
 use TemporaryFileWrangler;
 use BLASTer;
@@ -61,12 +62,27 @@ my $BP_SCAN_MAX_BLAST_DB_SIZE = 250;
 # possibility that BLAST will caps match counte (see blastn sefaults
 # for "max_target_seqs" and "num_alignemnts")
 
+my $SELF_CHECK_MIN_IDENTITY = 0.95;
+# identity of the HSP alignment
+my $SELF_CHECK_MIN_OVERLAP_FRAC_HQ = 0.95;
+# minimum overlap between the HSP and one of the two patterns
+# (one may be longer than the other)
+
+my $SELF_CHECK_MIN_OVERLAP_FRAC_LQ = 0.75;
+# lower-quality overlap requirement, for e.g. fusion clutter cases
+
+my $SELF_CHECK_AMBIG_BP_START = "R";
+my $SELF_CHECK_AMBIG_BP_END = "Y";
+my $SELF_CHECK_MIN_FLANK = 200;
+
+
 my @MATCH_STRINGS;
 my @FA_FIELDS;
 
 my %FLAGS;
 my @clopts = (
 	      "-file=s",
+	      "-files=s",
 
 	      "-describe-breakpoint-intron-sizes",
 	      "-genome=s",
@@ -80,7 +96,7 @@ my @clopts = (
 
 	      "-fuzzall-strong-sample=s",
 	      "-min-strong=i",
-	      "-only-strong=i",
+	      "-only-min-strong=i",
 	      # filter ID and sample list to only those showing given
 	      # number of strong+ hits
 
@@ -138,6 +154,7 @@ my @clopts = (
 	      "-find-ambiguous-pattern-symbols",
 
 	      "-pattern-filter-to-pattern-list=s",
+	      # excerpt
 
 	      "-pattern-add-interstitial-length=s",
 	      # add interstitial sequence size annotation to a pattern file
@@ -171,7 +188,7 @@ my @clopts = (
 
 	      "-bambino",
 
-	      "-source-traceback=s",
+	      "-source-traceback",
 	      # list of patterns to search for source record
 	      "-sources=s",
 	      # list of source files
@@ -197,6 +214,56 @@ my @clopts = (
 
 	      "-patch=s",
 	      "-show-module-dependencies",
+
+	      "-fuzzum-pair-post",
+	      # add additional annotations to fuzzum by gene pair
+	      # e.g. SJCOGALL010876_D3_by_gene.txt
+
+	      "-generate-minimal-cicero",
+
+	      "-patch-breakpoints-traceback",
+	      # patch genomic breakpoint info from source records,
+	      # via -source-traceback output
+	      "-patch-breakpoints-by-features",
+	      # patch genomic breakpoint info based on annotated
+	      # transcripts and exons (hack, primarily for Kriwacki
+	      # and other data lacking this information in source)
+
+
+	      "-fuzzum-merge",
+	      # merge fuzzum results by sample and pattern/pair
+	      # into an existing report containing those keys
+	      "-glob=s",
+	      # to match set of fuzzum file to process
+	      "-target=s",
+	      # file to merge into
+	      "-target-sample=s",
+	      "-target-id=s",
+	      "-header-prefix=s",
+	      # prefix to add to fuzzum columns merged in
+	      "-glob-fuzzum-pattern=s",
+	      # pattern-level fuzzum results
+
+	      "-debug",
+
+	      "-find-sj-cohort-bams",
+
+	      "-clean-hits",
+	      "-only-category=s",
+
+	      "-sv6=s",
+	      "-sample=s",
+	      "-genea=s",
+	      "-geneb=s",
+
+	      "-pattern-self-identity",
+	      "-index-start=i",
+	      "-index-end=i",
+	      "-index-out=s",
+	      "-pattern-self-identity-post=s",
+	      # remove duplicates
+
+	      "-clean-pattern-categories",
 	     );
 GetOptions(
 	   \%FLAGS,
@@ -270,8 +337,29 @@ if ($FLAGS{"describe-breakpoint-intron-sizes"}) {
   add_preferred_summary();
 } elsif ($FLAGS{"patch"}) {
   patch_patterns();
+} elsif ($FLAGS{"fuzzum-pair-post"}) {
+  fuzzum_pair_post();
+} elsif ($FLAGS{"generate-minimal-cicero"}) {
+  # skeleton/template file for contig-based pattern generation
+  generate_minimal_cicero();
+} elsif ($FLAGS{"patch-breakpoints-traceback"}) {
+  patch_breakpoints_traceback();
+} elsif ($FLAGS{"patch-breakpoints-by-features"}) {
+  patch_breakpoints_by_features();
+} elsif ($FLAGS{"fuzzum-merge"}) {
+  fuzzum_merge();
+} elsif ($FLAGS{"find-sj-cohort-bams"}) {
+  find_sj_cohort_bams();
+} elsif ($FLAGS{"clean-hits"}) {
+  clean_hits();
+} elsif ($FLAGS{"pattern-self-identity"}) {
+  pattern_self_identity();
+} elsif ($FLAGS{"pattern-self-identity-post"}) {
+  pattern_self_identity_post();
+} elsif ($FLAGS{"clean-pattern-categories"}) {
+  clean_pattern_categories();
 } else {
-  die "?";
+  die "unspecified command-line option";
 }
 exit(0);
 
@@ -579,13 +667,15 @@ sub fuzzall_strong_sample {
   # filter a fuzzall report:
   #  - filter ID count to only reads with a minimum number of strong reads
   #  - optionally filter matching ID details by same minimum count
+  #
+  # TO DO: add option to have a strong- policy as well
   my ($f_in) = @_;
   unless ($f_in) {
     $f_in = $FLAGS{"fuzzall-strong-sample"} || die;
   }
   my $min_strong = $FLAGS{"min-strong"} || die "-min-strong";
-  my $only_strong = $FLAGS{"only-strong"};
-  die "-only-strong [0|1]" unless defined $only_strong;
+  my $only_strong = $FLAGS{"only-min-strong"};
+  die "-only-min-strong [0|1]" unless defined $only_strong;
 
   my $f_out = basename($f_in) . ".min_strong.tab";
 
@@ -621,6 +711,7 @@ sub fuzzall_strong_sample {
 
       push @counts_for_sample_detail, $count if $only_strong ? $count >= $min_strong : 1;
     }
+#    printf STDERR "filtered: %s\n", join ",", @counts_for_sample_detail if @counts_for_sample_detail;
 
     my @all = map {@{$by_strong{$_}}} @counts_for_ids;
     my @detail = map {@{$by_strong{$_}}} @counts_for_sample_detail;
@@ -1890,6 +1981,7 @@ sub pattern2fasta {
 
     if ($usable) {
       my $id_line = ">" . $pid;
+      $id_line .= sprintf " /length=%d", length($seq);
 
       foreach my $f (@FA_FIELDS) {
 	# report additional annotation fields in header line
@@ -2179,14 +2271,21 @@ sub find_ambiguous_pattern_symbols {
 }
 
 sub filter_pattern_set {
-  my $f_in = $FLAGS{patterns} || die;
+  # extract a subset of patterns
+  my $f_in = $FLAGS{patterns} || die "-patterns FILE";
   my $f_filter = $FLAGS{"pattern-filter-to-pattern-list"} || die;
+  my $wanted;
+  my $match;
+  if (-f $f_filter) {
+    $wanted = read_simple_file($f_filter, "-hash1" => 1);
+  } else {
+    $match = $f_filter;
+  }
 
-  my $wanted = read_simple_file($f_filter, "-hash1" => 1);
   my $df = new DelimitedFile("-file" => $f_in,
 			     "-headers" => 1,
 			     );
-  my $outfile = basename($f_in) . ".filtered.tab";
+  my $outfile = $FLAGS{out} || basename($f_in) . ".filtered.tab";
   my $rpt = $df->get_reporter(
 			      "-file" => $outfile,
   			      "-auto_qc" => 1,
@@ -2195,7 +2294,13 @@ sub filter_pattern_set {
   # while (my $row = $df->next("-ref" => 1)) {  # headerless
   while (my $row = $df->get_hash()) {
     my $pid = $row->{pattern} || die;
-    $rpt->end_row($row) if $wanted->{$pid};
+    my $usable;
+    if ($match) {
+      $usable = 1 if $pid =~ /$match/;
+    } else {
+      $usable = 1 if $wanted->{$pid};
+    }
+    $rpt->end_row($row) if $usable;
   }
 
   $rpt->finish();
@@ -2337,6 +2442,7 @@ sub hit_read_compare {
 }
 
 sub get_read2pattern {
+  # for raw .hits files, not tsv
   my ($file) = @_;
   # quick hacky parser
   open(TMPR, $file) || die;
@@ -2476,7 +2582,7 @@ sub fuzzall_header_fix {
   my $wf = new WorkingFile($f_out);
   my $fh = $wf->output_filehandle();
 
-  open(IN, $f_fuzzall) || die;
+  open(IN, $f_fuzzall) || die "can't open $f_fuzzall: $!";
   my $header = <IN>;
   chomp $header;
   my @h = split /\t/, $header;
@@ -2738,14 +2844,28 @@ sub generate_bambino_viewer_scripts {
 sub source_traceback {
   # given a pattern file, a list of pattern IDs, and a list of
   # source files, find source record for given pattern
-  my $f_pattern_list = $FLAGS{"source-traceback"} || die;
-  my $f_patterns = $FLAGS{"patterns"} || die;
-  my $f_sources = $FLAGS{sources} || die;
+  my $f_pattern_list = $FLAGS{"pids"};
+  my $f_patterns = $FLAGS{"patterns"} || die "-patterns";
+  my $f_sources = $FLAGS{sources} || die "-sources";
   my $f_out = $FLAGS{out} || "traceback_source.tab";
+  find_binary("blastn", "-die" => 1);
 
-  my $check_patterns = read_simple_file($f_pattern_list);
+  my $max_good_results_per_pattern_and_source = 5;
+  # stop searching if we get some good quality results for some samples.
+  # otherwise for events with lots of samples we could report a lot of
+  # redundant results.
+
   my $patterns = load_pattern_file($f_patterns);
   # TO DO: option for pre-parsed hash
+
+  my $check_patterns;
+  if (my $f_pattern_list = $FLAGS{pids}) {
+    # check only a specific set of patterns
+    $check_patterns = read_simple_file($f_pattern_list);
+  } else {
+    # check all patterns
+    $check_patterns = [ sort keys %{$patterns} ];
+  }
 
   my $sources = read_simple_file($f_sources);
   my %tag2row_sample;
@@ -2772,6 +2892,7 @@ sub source_traceback {
 					   qw(
 					       link_pattern
 					       link_method
+					       link_rows
 					    )
 					  ],
   			      "-auto_qc" => 1,
@@ -2779,15 +2900,16 @@ sub source_traceback {
     $tag2rpt{$tag} = $rpt;
 
     while (my $row = $df->get_hash()) {
-      my $sample = $row->{sample} || die;
+      my $sample = $row->{sample} || die "no sample";
+      dump_die($row, "unknown format") unless exists $row->{geneA};
       my $geneA = $row->{geneA};
       my $geneB = $row->{geneB};
       # may need some flexibility here
       die unless defined $geneA or defined $geneB;
       # sometimes blank
       if ($geneA and $geneB) {
-	my @genes_a = split /,/, unquote($geneA);
-	my @genes_b = split /,/, unquote($geneB);
+	my @genes_a = parse_gene_list($geneA);
+	my @genes_b = parse_gene_list($geneB);
 	# might be a list  :/
 	foreach my $ga (@genes_a) {
 	  foreach my $gb (@genes_b) {
@@ -2798,9 +2920,20 @@ sub source_traceback {
     }
   }
 
+  my $c = new Counter($check_patterns);
   foreach my $pid (@{$check_patterns}) {
+    $c->next($pid);
     my $pr = $patterns->{$pid} || die;
-    my @source_tags = split /,/, $pr->{source} || die;
+
+    my %source_tags;
+    foreach my $st (split /,/, $pr->{source} || die) {
+      $st =~ s/\/.*//;
+      # strip off project suffix, e.g.
+      # pp_svfusion_2021_09_10/pcgp => pp_svfusion_2021_09_10
+      $source_tags{$st} = 1;
+    }
+    my @source_tags = sort keys %source_tags;
+
     my $samples_raw = $pr->{sample};
     unless ($samples_raw) {
       printf STDERR "ERROR: no sample annotation for %s, sources=%s\n", $pid, join ",", @source_tags;
@@ -2809,9 +2942,16 @@ sub source_traceback {
     my @samples = split /,/, $pr->{sample} || dump_die($pr, "no sample");
     # event might be found in more than one sample
 
-    my $geneA = $pr->{"genea_symbol"} || dump_die($pr, "no geneA");
-    my $geneB = $pr->{"geneb_symbol"} || die;
+    my $genea_list = $pr->{"genea_symbol"} || dump_die($pr, "no genea_symbol");
+    my $geneb_list = $pr->{"geneb_symbol"} || die;
+
+    my @geneA = split /,/, $genea_list;
+    my @geneB = split /,/, $geneb_list;
     # standardized pattern file column names for gene symbols
+    # due to merging, this may be a list.  The pattern ID will
+    # contain only one symbol, however this may also be harmonized
+    # to the latest HUGO symbol, which may not match the source data.
+    # These symbols should match the source files however.
 
     my $found_somewhere;
     # in some combination of source(s) and sample(s)
@@ -2819,6 +2959,7 @@ sub source_traceback {
     foreach my $source_tag (@source_tags) {
       # there may be more than one source file per pattern,
       # e.g. same event observed in multiple sets
+
       unless ($tag2row_sample{$source_tag}) {
 	# fix when happens: might be another source outside the list
 	printf STDERR "ERROR: no source for $source_tag\n";
@@ -2827,24 +2968,39 @@ sub source_traceback {
 
       # if more than one source/sample, don't know which sample
       # appears in this source
+
+      # TO DO: cap search at max # of good results?
+      # e.g. BCR-ABL1-44 has a huge number of sample IDs in ProteinPaint
+      my $count_good = 0;
+
       foreach my $sample (@samples) {
 	next unless $tag2row_sample{$source_tag}{$sample};
 	# might not be in this source
 
-	my $rows_src = $tag2row_sample{$source_tag}{$sample}{$geneA}{$geneB};
-	unless ($rows_src) {
-	  printf STDERR "ERROR: can't find $pid @samples $source_tag $sample $geneA $geneB\n";
+	my @rows_src;
+	foreach my $gene_a (@geneA) {
+	  foreach my $gene_b (@geneB) {
+	    if (my $set = $tag2row_sample{$source_tag}{$sample}{$gene_a}{$gene_b}) {
+	      printf STDERR "found %s-%s\n", $gene_a, $gene_b;
+	      push @rows_src, @{$set};
+	    }
+	  }
+	}
+
+	unless (@rows_src) {
+	  printf STDERR "ERROR: can't find $pid @samples $source_tag $sample $genea_list $geneb_list\n";
 	  next;
 	  # investigate
 	}
 
-	printf STDERR "source rows for %s / %s / %s: %d\n", $pid, $sample, $source_tag, scalar @{$rows_src};
+	printf STDERR "source rows for %s / %s / %s: %d.\n", $pid, $sample, $source_tag, scalar @rows_src;
 
 	$found_somewhere = 1;
 	my $found_type;
-	if (@{$rows_src} == 1) {
+	if (@rows_src == 1) {
 	  $found_type = "single_record";
-	} elsif (@{$rows_src} > 1) {
+	  $count_good++;
+	} elsif (@rows_src > 1) {
 	  #
 	  #  ambiguous source records.
 	  #  Resolve by finding best match to interstitial sequence,
@@ -2874,10 +3030,26 @@ sub source_traceback {
 	    my $ilen = length($interstitial);
 	    my $half_needed = int(($min_excerpt_length - $ilen) / 2);
 	    # or maybe use ceil()
-	    $seq =~ /(\w{$half_needed})[\]\}]/ || die;
-	    my $up = $1;
-	    $seq =~ /[\[\{](\w{$half_needed})/ || die;
-	    my $down= $1;
+	    my $up;
+	    if ($seq =~ /(\w{$half_needed})[\]\}]/) {
+	      # sufficient upstream sequence
+	      $up = $1;
+	    } elsif ($seq =~ /(\w+)[\]\}]/) {
+	      # insufficient, e.g. BLOC1S2-COL5A1-01
+	      # GGAAAC][CCAAGAAAGGCTACCAGAAGACGGTTCTGGA
+	      $up = $1;
+	    } else {
+	      die;
+	    }
+
+	    my $down;
+	    if ($seq =~ /[\[\{](\w{$half_needed})/) {
+	      $down= $1;
+	    } elsif ($seq =~ /[\[\{](\w+)/) {
+	      $down = $1;
+	    } else {
+	      die;
+	    }
 	    $junction_excerpt = join "", $up, $interstitial, $down;
 #	    die "no/insufficient interstitial in $seq $ilen $half_needed $up $down $junction_excerpt";
 	  }
@@ -2893,11 +3065,17 @@ sub source_traceback {
 	  my %id2row;
 	  my $id_counter = 0;
 	  my %db;
-	  foreach my $r (@{$rows_src}) {
-	    my $id = "contig_" . ++$id_counter;
-	    $db{$id} = $r->{contig};
-	    $id2row{$id} = $r;
+	  foreach my $r (@rows_src) {
+	    die "no contig field" unless exists $r->{contig};
+	    if (my $contig = $r->{contig}) {
+	      # may not always be present
+	      my $id = "contig_" . ++$id_counter;
+	      $db{$id} = $r->{contig} || dump_die($r, "no contig info!");
+	      $id2row{$id} = $r;
+	    }
 	  }
+	  die "no contig info available for $pid" unless %db;
+
 	  write_fasta($f_query, { "query" => $junction_excerpt });
 	  write_fasta($f_db, \%db);
 
@@ -2961,13 +3139,14 @@ sub source_traceback {
 
 	  if ($found_blast) {
 	    my $match_row = $id2row{$found_blast} || die;
-	    $rows_src = [ $match_row ];
+	    @rows_src = ( $match_row );
 	    $found_type = "blast_perfect";
 	    printf STDERR "   ...rescued via blast\n";
+	    $count_good++;
 	  } elsif ($found_blast_alt) {
 	    # HOWEVER: what if a better match found in a different source?
 	    my $match_row = $id2row{$found_blast_alt} || die;
-	    $rows_src = [ $match_row ];
+	    @rows_src = ( $match_row );
 	    printf STDERR "   ...rescued via blast (secondary)\n";
 	    $found_type = "blast_shorter";
 	  } else {
@@ -2983,10 +3162,16 @@ sub source_traceback {
 	#  write source record for this source/sample:
 	#
 	my $rpt = $tag2rpt{$source_tag};
-	foreach my $r (@{$rows_src}) {
+	foreach my $r (@rows_src) {
 	  $r->{link_pattern} = $pid;
-	  $r->{link_method} = $found_type || "not_found";
+	  $r->{link_method} = $found_type || "ambiguous";
+	  $r->{link_rows} = scalar @rows_src;
 	  $rpt->end_row($r);
+	}
+
+	if ($count_good >= $max_good_results_per_pattern_and_source) {
+	  printf STDERR "stopping sample search in %s after %d good matches\n", $source_tag, $count_good;
+	  last;
 	}
       }  # $sample
     }  # $source_tag
@@ -3674,15 +3859,1143 @@ sub patch_patterns {
   }
 
   # write final output:
+  my %delete_needed = %delete;
   foreach my $r (@{$patterns}) {
     my $pid = $r->{pattern} || die;
     my $usable = 1;
-    $usable = 0 if $delete{$pid};
+    if ($delete{$pid}) {
+      $usable = 0;
+      delete $delete_needed{$pid}
+    }
 
     $rpt->end_row($r) if $usable;
   }
+
+  if (%delete_needed) {
+    die sprintf "ERROR: can't find requested patterns to delete: %s", join ",", sort keys %delete_needed;
+  }
+
+  
+  $rpt->finish();
+}
+
+sub fuzzum_pair_post {
+  # postprocess fuzzall results
+  my $files;
+  if (my $one = $FLAGS{file}) {
+    $files = [ $one ];
+  } elsif (my $list = $FLAGS{files}) {
+    $files = read_simple_file($list);
+  } elsif (my $glob = $FLAGS{glob}) {
+    $files = [ glob($glob) ];
+    die "$glob matches no files" unless @{$files};
+  } else {
+    die "specify -file FUZZUM | -files LISTFILE | -glob PATTERN";
+  }
+  die "no files" unless $files and @{$files};
+  my $patterns = load_pattern_file($FLAGS{patterns} || die "-patterns");
+  my ($k_test) = (keys %{$patterns});
+  die "patterns file missing gte_rank annotation" unless $patterns->{$k_test}{gte_rank};
+
+  my @h_new = qw(
+		  exon_key
+	       );
+
+  my $format_oncoprint = 1;
+  # https://docs.google.com/document/d/1klDZ0MHVkQTW2-lCu_AvpRE4_FcbhdB-yI17wNdPaOM/edit?tab=t.0
+
+  my $f_out_gene_a;
+  my $f_out_acc_a;
+  my $f_out_chr_a;
+  my $f_out_pos_a;
+  my $f_out_strand_a;
+
+  my $f_out_gene_b;
+  my $f_out_acc_b;
+  my $f_out_chr_b;
+  my $f_out_pos_b;
+  my $f_out_strand_b;
+
+  if ($format_oncoprint) {
+    $f_out_gene_a = "gene_a";
+    $f_out_acc_a = "isoform_a";
+    $f_out_chr_a = "chr_a";
+    $f_out_pos_a = "position_a";
+    $f_out_strand_a = "strand_a";
+
+    $f_out_gene_b = "gene_b";
+    $f_out_acc_b = "isoform_b";
+    $f_out_chr_b = "chr_b";
+    $f_out_pos_b = "position_b";
+    $f_out_strand_b = "strand_b";
+  } else {
+    die "implement other formats, e.g. cicero";
+  }
+
+  push @h_new, (
+		$f_out_gene_a,
+		$f_out_acc_a,
+		$f_out_chr_a,
+		$f_out_pos_a,
+		$f_out_strand_a,
+
+		$f_out_gene_b,
+		$f_out_acc_b,
+		$f_out_chr_b,
+		$f_out_pos_b,
+		$f_out_strand_b,
+	       );
+
+  foreach my $f_fuzzum (@{$files}) {
+    my $f_hits = $FLAGS{hits};
+    if ($f_hits) {
+      die "-hits not compatible with -files" if @{$files} > 1;
+    } else {
+      my $h = $f_fuzzum;
+#      if ($h =~ s/_by_gene.txt/_sorted.txt/) {
+#	$f_hits = $h if -s $h;
+#      }
+      if ($h =~ s/\.\w+\.txt$//) {
+	# .by_gene.txt, .fuzzum.txt
+	$f_hits = $h if -s $h;
+      }
+    }
+    die "no hits file" unless $f_hits;
+    die "invalid hits file $f_hits" unless -s $f_hits;
+
+    my %pair2patterns;
+    #
+    #  parse hits file, track hits by pair and pattern ID:
+    #
+    my $df = new DelimitedFile("-file" => $f_hits,
+			       "-headers" => 1,
+			      );
+    my $f_id = $df->headers_raw()->[0];
+    while (my $row = $df->get_hash()) {
+      if ($row->{$f_id} =~ /^pattern (\S+)/) {
+	my $pid = $1;
+	my $pair = $row->{gene_pair} || die;
+	# should be populated
+	$pair2patterns{$pair}{$pid}++;
+	# track counts of hits by pattern
+      }
+    }
+
+    my $f_out = $FLAGS{out} || basename($f_fuzzum . ".exons.tsv");
+
+    $df = new DelimitedFile("-file" => $f_fuzzum,
+			    "-headers" => 1,
+			   );
+    my $rpt = $df->get_reporter(
+				"-file" => $f_out,
+				"-extra" => \@h_new,
+				"-auto_qc" => 1,
+			       );
+
+    while (my $row = $df->get_hash()) {
+      my $pair = $row->{"pattern group"} || die;
+      # gene pair
+
+      my $set = $pair2patterns{$pair} || die;
+      # pattern->count bucket
+
+      #    my @sorted = sort {$set->{$b} <=> $set->{$a}} keys %{$set};
+      my @sorted = sort {$set->{$b} <=> $set->{$a} ||
+			   $patterns->{$a}{gte_rank} <=> $patterns->{$b}{gte_rank}
+			 } keys %{$set};
+
+      # multi-stage sort: first by number of reads hitting a pattern,
+      # and secondarily by preferred transcript ranking.  In other
+      # words, if multiple patterns have the same number of supporting
+      # reads, for transcript annotation purposes choose the one with
+      # the highest SJ preferred isoform ranking.
+
+      # 1. patt
+      # TO DO: if multiple patterns share the same count,
+      # further tiebreaking by SJPI?
+#      printf STDERR "count: %d\n", scalar @sorted;
+      if (@sorted >= 5) {
+	#      die join ",", map {$_, $set->{$_}, $patterns->{$_}->{gte_rank}, " "} @sorted;
+      }
+
+      my $best = $sorted[0];
+
+      my $pattern = $patterns->{$best} || die;
+
+      dump_die($pattern, "no gte_A_exon") unless $pattern->{gte_A_exon};
+      dump_die($pattern, "no gte_B_exon") unless $pattern->{gte_B_exon};
+
+      my $key = sprintf '%s.%s-%s',
+	$pair,
+	($pattern->{gte_A_exon} || die),
+	($pattern->{gte_B_exon} || die);
+      my $gene_a = $pattern->{gte_A_gene};
+      my $acc_a = $pattern->{gte_A_transcript};
+      my $gene_b = $pattern->{gte_B_gene};;
+      my $acc_b = $pattern->{gte_B_transcript};
+
+      $row->{exon_key} = $key;
+
+      $row->{$f_out_gene_a} = $gene_a;
+      $row->{$f_out_acc_a} = $acc_a;
+      $row->{$f_out_chr_a} = $pattern->{genea_chr};
+      $row->{$f_out_pos_a} = $pattern->{genea_pos};
+      $row->{$f_out_strand_a} = $pattern->{genea_strand};
+
+      $row->{$f_out_gene_b} = $gene_b;
+      $row->{$f_out_acc_b} = $acc_b;
+      $row->{$f_out_chr_b} = $pattern->{geneb_chr};
+      $row->{$f_out_pos_b} = $pattern->{geneb_pos};
+      $row->{$f_out_strand_b} = $pattern->{geneb_strand};
+
+      $rpt->end_row($row);
+    }
+
+    $rpt->finish();
+    # iterate through fuzzum file, create report
+    # foreach pair, find most commonly-hit pattern
+    # find PREFERRED exon annotation for this pattern
+  }
+}
+
+sub generate_minimal_cicero {
+  # generate a minimal/skeletal cicero-format file for use with
+  # fz2 pattern generation
+  my $f_out = $FLAGS{file} || die "-file OUTFILE";
+
+  my @f_cicero = qw(
+		     sample
+		     geneA
+		     chrA
+		     posA
+		     ortA
+		     geneB
+		     chrB
+		     posB
+		     ortB
+		     contig
+		     pathogenicity_somatic
+		  );
+
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => \@f_cicero,
+			 "-auto_qc" => 1,
+			);
+  my %r;
+  # TO DO: tie() to remember previous values?
+  $| = 1;
+
+  if (my $sv6 = $FLAGS{sv6}) {
+    $r{sample} = $FLAGS{sample} || die "-sample";
+    $r{geneA} = $FLAGS{genea} || die "-genea";
+    $r{geneB} = $FLAGS{geneb} || die "-geneb";
+    my @f = split /\./, $sv6;
+    die unless @f == 6;
+    @r{qw(
+	   chrA
+	   posA
+	   ortA
+	   chrB
+	   posB
+	   ortB
+	)} = @f;
+    $r{contig} = "";
+    $r{pathogenicity_somatic} = "";
+  } else {
+    foreach my $f (@f_cicero) {
+      printf "%s: ", $f;
+      my $v = <STDIN>;
+      chomp $v;
+      $v = "" unless defined $v;
+      $r{$f} = $v;
+    }
+  }
+  $rpt->end_row(\%r);
+  $rpt->finish();
+}
+
+sub patch_breakpoints_traceback {
+  my @f_traceback = glob("*.traceback.tab");
+  die "no .traceback.tab files" unless @f_traceback;
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+
+  # parse all traceback files
+  # bucket rows by source and match type
+  #  - just save chrA/B arrayrefs rather than full row contents?
+  # foreach pattern row:
+  #  - gather all hits by source and match type
+  #  - choose the best source/match type
+
+
+  #
+  #  track tracebacks by pid and link method:
+  #
+  my %pid;
+  foreach my $f_traceback (@f_traceback) {
+    my $df = new DelimitedFile("-file" => $f_traceback,
+			     "-headers" => 1,
+			     );
+    while (my $row = $df->get_hash()) {
+      my $pid = $row->{link_pattern} || die;
+      my $link_method = $row->{link_method} || die;
+
+      my $chrA = $row->{chrA} || die;
+      my $posA = $row->{posA} || die;
+      my $chrB = $row->{chrB} || die;
+      my $posB = $row->{posB} || die;
+
+      my $ortA = "";
+      my $ortB = "";
+      if (exists $row->{ortA}) {
+	# CICERO-style source fields
+	$ortA = $row->{ortA} || "";
+	$ortB = $row->{ortB} || "";
+	# value is sometimes not populated e.g. in ProteinPaint db
+      }
+
+#      printf STDERR "track %s\n", join " ", $pid, $link_method, $chrA, $posA, $ortA, $chrB, $posB, $ortB;
+
+      push @{$pid{$pid}{$link_method}}, [ $chrA, $posA, $ortA, $chrB, $posB, $ortB ];
+    }
+  }
+
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $outfile = basename($f_patterns) . ".breakpoints.tab";
+
+  my @h_new = qw(
+		  genea_chr
+		  genea_pos
+		  genea_strand
+		  geneb_chr
+		  geneb_pos
+		  geneb_strand
+	       );
+  push @h_new, "link_method" if $FLAGS{debug};
+
+  my $rpt = $df->get_reporter(
+			      "-file" => $outfile,
+			      "-extra" => \@h_new,
+  			      "-auto_qc" => 1,
+			     );
+  # use fuzzion2 pattern file column names for these annotations,
+  # rather than CICERO/source format column names
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+
+  my $rank = 0;
+  my %method2rank;
+  $method2rank{"single_record"} = ++$rank;
+  $method2rank{"blast_perfect"} = ++$rank;
+  $method2rank{"blast_shorter"} = ++$rank;
+  $method2rank{"ambiguous"} = ++$rank;
+
+  my $total = 0;
+  my $has_value = 0;
+  my $missing = 0;
+
+  while (my $row = $df->get_hash()) {
+    my $pid = $row->{pattern} || die;
+    my $chrA = "";
+    my $chrB = "";
+    my $posA = "";
+    my $posB = "";
+    my $ortA = "";
+    my $ortB = "";
+    my $link_method = "missing";
+    if (my $set = $pid{$pid}) {
+      foreach my $method (keys %{$set}) {
+	die "no rank for $method" unless $method2rank{$method};
+      }
+      ($link_method) = sort {$method2rank{$a} <=> $method2rank{$b}} keys %{$set};
+      my $records = $set->{$link_method} || die;
+      ($chrA, $posA, $ortA, $chrB, $posB, $ortB) = @{$records->[0]};
+
+      if ($link_method eq "ambiguous") {
+	my %unique = map {join(".", @{$_}), 1} @{$records};
+	if (scalar keys %unique == 1) {
+	  $link_method = "rescue_ambiguous_records_but_unique_positions";
+	} else {
+	  $link_method = sprintf "ambiguous_non_unique_positions=%d", scalar keys %unique;
+	}
+      }
+    }
+    $row->{genea_chr} = $chrA;
+    $row->{genea_pos} = $posA;
+    $row->{genea_strand} = $ortA;
+    $row->{geneb_chr} = $chrB;
+    $row->{geneb_pos} = $posB;
+    $row->{geneb_strand} = $ortB;
+    $row->{link_method} = $link_method;
+    $rpt->end_row($row);
+
+    $total++;
+    if ($chrA and $posA and $chrB and $posB) {
+      $has_value++;
+    } else {
+      $missing++;
+    }
+  }
+
   $rpt->finish();
 
+  printf STDERR "total:%d populated:%d blank:%d\n", $total, $has_value, $missing;
 
 
 }
+
+
+sub patch_breakpoints_by_features {
+  # last-gap breakpoint annotation based on transcript/exon
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  my $f_refflat = $FLAGS{refflat} || die "-refflat";
+  my $f_out = basename($f_patterns) . ".breakpoints.tab";
+
+  my $rff = new RefFlatFile();
+  $rff->canonical_references_only(1);
+  $rff->strip_sharp_annotations(1);
+  $rff->parse_file(
+		  "-refflat" => $f_refflat,
+		  "-type" => "refgene",
+		 );
+
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  while (my $row = $df->get_hash()) {
+    if ($row->{genea_chr} and $row->{genea_pos} and
+	$row->{geneb_chr} and $row->{geneb_pos} and
+	$row->{genea_strand} and $row->{geneb_strand}
+       ) {
+      # nothing to do
+    } else {
+      my $pair = $row->{gte_key} || die;
+      my @f = split /,/, $pair, -1;
+      # for e.g. ""MAP3K8,NM_005204.4,exon_8,intergenic,,"
+      die "GTE field count mismatch: expected 6, value=$pair" unless @f == 6;
+      my ($geneA, $accA, $featureA,
+	  $geneB, $accB, $featureB) = @f;
+      set_rf_breakpoint($row, "A", $rff, $accA, $featureA);
+      set_rf_breakpoint($row, "B", $rff, $accB, $featureB);
+      # if missing, set genomic breakpoint by accession feature site
+
+      set_rf_strand($row, "A", $rff, $accA);
+      set_rf_strand($row, "B", $rff, $accB);
+      # if missing, set strand by refflat mapping
+    }
+    $rpt->end_row($row);
+  }
+
+  $rpt->finish();
+}
+
+sub set_rf_breakpoint {
+  my ($row, $side, $rff, $acc, $feature) = @_;
+  #  my $f_chr = "chr" . $side;
+  #  my $f_pos = "pos" . $side;
+  my $f_chr = sprintf "gene%s_chr", lc($side);
+  my $f_pos = sprintf "gene%s_pos", lc($side);
+
+  my $process = 1;
+  $process = 0 if $row->{$f_chr} and $row->{$f_pos};
+  # to to: option to clobber?
+
+  my $set;
+  my $rf;
+  my $wanted_exon;
+  if ($process and $acc) {
+    if ($set = $rff->find_by_accession($acc, "-warn-mismatch" => 1)) {
+      printf STDERR "WARNING: multiple refseq mappings for %s\n", $acc
+	if @{$set} > 1;
+      $rf = $set->[0];
+      if ($feature =~ /_(\d+)/) {
+	$wanted_exon = $1;
+      } else {
+	printf STDERR "WARNING: can't find feature number in %s\n", $feature;
+      }
+    } else {
+      printf STDERR "WARNING: can't find refflat entry for %s\n", $acc;
+    }
+  }
+
+  if ($process and $acc and $set and $wanted_exon) {
+    # processable
+    my $chr = "";
+    my $pos = "";
+    my $found;
+    my $strand = $rf->{strand} || dump_die($rf, "invalid strand");
+    die "invalid strand" unless $strand eq "+" or $strand eq "-";
+    $chr = $rf->{chrom} || die;
+    my $exon_count = 0;
+
+    my @exons = @{$rf->{exons}};
+    @exons = reverse(@exons) if $strand eq "-";
+    # in a refflat file, exons are always ordered genomically
+    # regardless of transcript strand
+
+    foreach my $exon (@exons) {
+      $exon_count++;
+      if (0) {
+	printf STDERR "debug %s, strand %s exon %d: %s:%d-%d\n", $acc, $strand, $exon_count, $chr, $exon->{start}, $exon->{end};
+      }
+      if ($exon_count == $wanted_exon) {
+	die sprintf "sanity fail for %s: start=%d end=%d", $acc, $exon->{start}, $exon->{end} unless $exon->{start} <= $exon->{end};
+	# sanity: assume always in genomic rather than transcript context
+	# NM_001017915.3: same base # (?)
+
+	if ($side eq "A") {
+	  # upstream: want last base of exon
+	  if ($strand eq "+") {
+	    $pos = $exon->{end} || die;
+	  } elsif ($strand eq "-") {
+	    $pos = $exon->{start} || die;
+	  } else {
+	    die;
+	  }
+	} elsif ($side eq "B") {
+	  # downtream: want first base of exon
+	  if ($strand eq "+") {
+	    $pos = $exon->{start} || die;
+	  } elsif ($strand eq "-") {
+	    $pos = $exon->{end} || die;
+#	    printf STDERR "CHECK: $acc $strand $wanted_exon $chr $pos\n";
+	  } else {
+	    die "X";
+	  }
+	} else {
+	  die;
+	}
+#	dump_die($exon, "debug", 1);
+      }
+    }
+
+    $row->{$f_chr} = $chr;
+    $row->{$f_pos} = $pos;
+  }
+}
+
+sub set_rf_strand {
+  my ($row, $side, $rff, $acc) = @_;
+  #  my $f_chr = "chr" . $side;
+  #  my $f_pos = "pos" . $side;
+  my $f_strand = sprintf "gene%s_strand", lc($side);
+
+  my $process = 1;
+  $process = 0 if $row->{$f_strand};
+  # to to: option to clobber?
+
+  my $set;
+  my $rf;
+  if ($process and $acc) {
+    if ($set = $rff->find_by_accession($acc, "-warn-mismatch" => 1)) {
+      my %strands = map {$_->{strand}, 1} @{$set};
+      if (scalar keys %strands > 1) {
+	printf STDERR "WARNING: multiple strand mappings for %s\n", $acc;
+      } else {
+	my ($strand) = keys %strands;
+	$row->{$f_strand} = $strand;
+	printf STDERR "set strand for %s to %s\n", $acc, $strand;
+      }
+    } else {
+      printf STDERR "WARNING: can't find refflat entry for %s\n", $acc;
+    }
+  }
+
+}
+
+sub fuzzum_merge {
+  my $f_target = $FLAGS{target} || die "-target";
+  my $target_sample = $FLAGS{"target-sample"} || die "-target-sample";
+  my $target_id = $FLAGS{"target-id"} || die "-target-id";
+  my $glob = $FLAGS{glob} || die "-glob";
+  my @f_fuzzum = glob($glob);
+  die "no files matching $glob" unless @f_fuzzum;
+  my $prefix = $FLAGS{"header-prefix"} || die "-header-prefix STRING";
+
+  my %fuzzum;
+  #
+  #  bucket fuzzum info by sample and tracking ID:
+  #
+  my ($h_fuzzum_sample, $h_fuzzum_id);
+  my @h_add;
+  foreach my $f (@f_fuzzum) {
+    my $df = new DelimitedFile("-file" => $f,
+			     "-headers" => 1,
+			      );
+    unless ($h_fuzzum_sample) {
+      my $h = $df->headers_raw;
+      $h_fuzzum_sample = $h->[0];
+      $h_fuzzum_id = $h->[$#$h];
+      # in fuzzum file, columns for sample and pattern/group can be
+      # inferred from header line.
+      for (my $i = 1; $i < $#$h; $i++) {
+	push @h_add, $h->[$i];
+      }
+    }
+    while (my $row = $df->get_hash()) {
+      my $sample = $row->{$h_fuzzum_sample} || die;
+      my $id = $row->{$h_fuzzum_id} || die;
+      die if $fuzzum{$sample}{$id};
+      $fuzzum{$sample}{$id} = $row;
+    }
+  }
+
+  my %fuzzum_patterns;
+  my $report_best_pattern = $FLAGS{"glob-fuzzum-pattern"};
+  if ($report_best_pattern) {
+    push @h_add, "best_pattern";
+    push @h_add, "best_pattern_count";
+    my @f_fuzzum_pattern = glob($report_best_pattern);
+    foreach my $f (@f_fuzzum_pattern) {
+      my $df = new DelimitedFile("-file" => $f,
+				 "-headers" => 1,
+				);
+      while (my $row = $df->get_hash()) {
+	my $sample = $row->{$h_fuzzum_sample} || die;
+	my $pid = $row->{pattern} || die;
+	my $pair = $row->{gene_pair} || die;
+	my $strong_plus = $row->{"strong+"};
+	die unless defined $strong_plus;
+	$fuzzum_patterns{$sample}{$pair}{$pid} += $strong_plus;
+      }
+    }
+  }
+
+  #
+  #  merge:
+  #
+
+  my $suffix = sprintf ".%s.tsv", $prefix;
+  # TO DO:
+  # - check for leading period
+  # - convert any whitespace to _
+#  my $suffix = ".merged.tsv";
+  my $f_out = basename($f_target) . $suffix;
+  my $df = new DelimitedFile("-file" => $f_target,
+			     "-headers" => 1,
+			    );
+  my @h_prefixed = map {$prefix . "_" . $_} @h_add;
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+			      "-extra" => \@h_prefixed,
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  while (my $row = $df->get_hash()) {
+    my $sample = $row->{$target_sample} || die;
+    my $id = $row->{$target_id};
+    if (my $fr = $fuzzum{$sample}{$id}) {
+      foreach my $h (@h_add) {
+	my $h_prefixed = $prefix . "_" . $h;
+	$row->{$h_prefixed} = $fr->{$h};
+      }
+
+      if ($report_best_pattern) {
+	if (my $set = $fuzzum_patterns{$sample}{$id}) {
+	  my ($best) = sort {$set->{$b} <=> $set->{$a}} keys %{$set};
+	  $row->{$prefix . "_best_pattern"} = $best;
+	  $row->{$prefix . "_best_pattern_count"} = $set->{$best};
+	} else {
+#	  print STDERR "ERROR: no data for $sample $id\n";
+	  die "ERROR: no data for $sample $id\n";
+	  # should always have this
+	}
+      }
+    } else {
+      foreach my $f (@h_prefixed) {
+	$row->{$f} = "";
+      }
+    }
+    $rpt->end_row($row);
+  }
+  $rpt->finish();
+
+}
+
+sub parse_gene_list {
+  my ($list) = @_;
+  my @genes = split /,/, unquote($list);
+  foreach (@genes) {
+    my $orig = $_;
+    if (s/_loc[A-Z]$//) {
+      # refflat "sharp" name modifications
+#      die "$orig => $_";
+    }
+  }
+  return @genes;
+}
+
+sub find_sj_cohort_bams {
+  my $run_dir = "/research_jude/rgs01_jude/groups/zhanggrp/projects/MethodDevelopment/common/fuzzion2/PaperTests/v1.4.0_St_Jude_RNA_patterns_2024-10-11a/STJUDE/";
+  # /research_jude/rgs01_jude/groups/zhanggrp/projects/MethodDevelopment/common/fuzzion2/PaperTests/v1.4.0_St_Jude_RNA_patterns_2024-10-11a/STJUDE/*by_gene.txt|sed 's/.*\///'|sed 's/_by_gene.txt//' > ~/steve_sj_sample_list.txt
+  my $f_bam_cache = $ENV{HOME} . "/restricted_bam_cache.txt";
+
+  # OTHER QUESTIONS: CSTN (childhood solid tumor network?) vs. other
+
+  #
+  #  index available BAMs:
+  #
+  die unless -s $f_bam_cache;
+  my $files = read_simple_file($f_bam_cache);
+  my %bams;
+  foreach my $bam (@{$files}) {
+    next unless $bam =~ /TRANSCRIPTOME/;
+    next unless $bam =~ /GRCh38/;
+    next if $bam =~ /\/backup\//;
+    # exclude "backup" dirs, e.g.
+    # /research/rgs01/reference/restricted/ClinicalGenomics/GRCh38/ClinicalPilot/FINAL/TRANSCRIPTOME/v2.0.0/backup/SJMLL001_D.RNA-Seq.bam
+    my $sample = basename($bam);
+    $sample =~ s/\..*// || die;
+    push @{$bams{$sample}}, $bam;
+  }
+
+  #
+  #  get desired sample list:
+  #
+  my %samples;
+  if (my $f_samples = $FLAGS{samples}) {
+    my $set = read_simple_file($f_samples, "-hash1" => 1);
+    %samples = %{$set};
+  } else {
+    die unless -d $run_dir;
+    my @files = glob($run_dir . "/*by_gene.txt");
+    die unless @files;
+    foreach my $file (@files) {
+      my $sample = basename($file);
+      $sample =~ s/_by_gene\.txt$// || die;
+      die "duplicate sample $sample" if $samples{$sample};
+      $samples{$sample} = 1;
+    }
+  }
+
+  #
+  #  xref samples, deal with duplicates:
+  #
+  my $f_cohort_bams = "SJ_cohort_bams.txt";
+  my $wf = new WorkingFile($f_cohort_bams);
+  my $fh = $wf->output_filehandle();
+  foreach my $sample (sort keys %samples) {
+    my $set = $bams{$sample} || die "no BAMs for $sample";
+    my $final;
+    if (@{$set} == 1) {
+      $final = $set->[0];
+    } else {
+      # algorithm here?  larger/newer file?
+      # ignore certain projects like ClinicalPilot?
+      my @set = sort {-s $b <=> -s $a } @{$set};
+      my $s1 = -s $set[0];
+      my $s2 = -s $set[1];
+      my $frac = $s1 / $s2;
+      printf STDERR "largest is %.2f vs second: %s\n", $frac, join " ", @set;
+      $final = $set[0];
+    }
+
+    die unless $final;
+    printf $fh "%s\n", $final;
+
+  }
+  $wf->finish();
+
+}
+
+sub clean_hits {
+  my $patterns = load_pattern_file($FLAGS{patterns} || die "-patterns");
+
+  my @files;
+  if (my $glob = $FLAGS{glob}) {
+    @files = glob($glob);
+  } elsif (my $lf = $FLAGS{files}) {
+    my $files = read_simple_file($lf);
+    @files = @{$files};
+  } else {
+    die "specify -glob GLOB|-files LISTFILE";
+  }
+  die "no files" unless @files;
+
+  my $f_category = "category";
+  # review
+
+  my $only_category = $FLAGS{"only-category"};
+
+  my %bad_categories = map {$_, 1} (
+				    "circRNA",
+				    "GTExRecurrent",
+				    "ReadThrough",
+
+				    "Problematic Patterns",
+				    # old label, retired in set11
+				   );
+  foreach my $f_hit (@files) {
+    my %removed;
+    my $f_out = basename($f_hit) . ".filtered";
+    # to do: maybe keep as .hits for compatibility w/other expectations?
+    my $fh = new Fuzzion2Hits(
+			      "-hits" => $f_hit,
+			      "-out" => $f_out
+			     );
+    my $count_usable = 0;
+    my $count_unusable = 0;
+    while (my $info = $fh->next_row()) {
+      my $usable = 1;
+      my $pid = $fh->get_pid;
+      my $category;
+      if (my $p = $patterns->{$pid}) {
+	dump_die($p, "no $f_category") unless exists $p->{$f_category};
+	$category = $p->{$f_category};
+	$usable = 0 if $bad_categories{$category};
+
+	if ($only_category) {
+	  $usable = $category eq $only_category;
+	}
+      } else {
+	print STDERR "WARNING: can't find pattern for $pid\n";
+      }
+      if ($usable) {
+	$count_usable++;
+	$fh->write_row();
+      } else {
+	$count_unusable++;
+	$removed{$category}++;
+      }
+    }
+    $fh->finish;
+
+    printf STDERR "%s: removed %s\n",
+      basename($f_hit),
+      join(", ", map {$_ . ":" . $removed{$_}} sort keys %removed);
+  }
+}
+
+sub get_patterns {
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  return load_pattern_file($f_patterns);
+}
+
+sub pattern_self_identity {
+  # compare pattern set vs. itself, looking for strong matches to
+  # patterns for other gene pairs, e.g. ATXN1-NUTM*
+  find_binary("blastn", "-die" => 1);
+
+  printf STDERR "NOTE: results will need to be postprocessed to remove duplicates, e.g. A->B, B->A results\n";
+
+  my $patterns = get_patterns();
+  my $tfw = new TemporaryFileWrangler();
+  my ($f_query, $f_db);
+  my $verbose = $FLAGS{verbose};
+  if ($verbose) {
+    print STDERR "DEBUG .fa files\n";
+    $f_query = "query.fa";
+    $f_db = "db.fa";
+  } else {
+    $f_query = $tfw->get_tempfile("-append" => ".query.fa");
+    $f_db = $tfw->get_tempfile("-append" => ".db.fa");
+  }
+
+  my $blast = new BLASTer();
+  $blast->blast_2_sequences(1);
+  $blast->output_format("xml");
+
+  my @pid_sorted = sort keys %{$patterns};
+
+  my $index_start = $FLAGS{"index-start"};
+  my $index_end = $FLAGS{"index-end"};
+  my $index_out = $FLAGS{"index-out"};
+
+  my $f_out = $index_out ||
+    basename($FLAGS{patterns}) . ".self_dupcheck.tsv";
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => [
+				       qw(
+					   pattern
+					   gene_pair
+					   other_pattern
+					   other_gene_pair
+					   match_type
+					   pattern_overlap
+					   blast_overlap
+					   blast_identity
+					)
+				      ],
+			 "-auto_qc" => 1,
+			);
+
+  my @pid_process;
+  if (defined $index_start) {
+    # slice, e.g. from mux.pl -index-mode
+    $rpt->write_headers();
+    # force header write for mux rejoin, otherwise size 0 files
+    # for sets w/no data
+    @pid_process = @pid_sorted[$index_start .. $index_end];
+  } else {
+    # slow
+    @pid_process = @pid_sorted;
+  }
+
+  my $c = new Counter(\@pid_process);
+  foreach my $pid_this (@pid_process) {
+    $c->next($pid_this);
+    my $p_this = $patterns->{$pid_this} || die;
+    my $pair_this = $p_this->{gene_pair} || die;
+    my $seq_this = mask_pattern($p_this->{sequence});
+    my %db;
+    foreach my $pid_other (@pid_sorted) {
+      # build set of all patterns for OTHER gene pairs
+      my $p_other = $patterns->{$pid_other} || die;
+      unless ($p_other->{gene_pair} eq $pair_this) {
+	my $seq_other = mask_pattern($patterns->{$pid_other}{sequence});
+	$db{$pid_other} = $seq_other;
+      }
+    }
+    die "ERROR: no other patterns found??" unless %db;
+    # shouldn't happen
+    unlink($f_query, $f_db);
+    write_fasta($f_query, { $pid_this => $seq_this });
+    write_fasta($f_db, \%db);
+
+    my $parser = $blast->blast(
+			       "-query" => $f_query,
+			       "-database" => $f_db
+			      );
+    my $result = $parser->next_result;
+    # one object per query sequence (only one query seq)
+
+    if ($result) {
+      while (my $hit = $result->next_hit()) {
+	my $hit_name = $hit->name();
+	my $p_other = $patterns->{$hit_name} || die;
+
+	my $hsp = $hit->next_hsp();
+	# can be more than one HSP per hit, however for this application
+	# we're only interested in single-HSP hits
+
+	printf STDERR "    score:%s name:%s strand:%s q:%d-%d subj:%d-%d num_identical:%d frac_identical_query:%s frac_identical_hit:%s query_span:%d ref_span:%d total_span=%d query_string=%s hit_string=%s\n",
+	  $hsp->score,
+	  $hit->name,
+	  $hsp->strand,
+	  $hsp->range("query"),
+	  $hsp->range("hit"),
+	  $hsp->num_identical(),
+	  $hsp->frac_identical("query"),
+	  $hsp->frac_identical("hit"),
+	  $hsp->length("query"),
+	  $hsp->length("hit"),
+	  $hsp->length("total"),
+	  $hsp->query_string(),
+	  $hsp->hit_string() if $verbose;
+
+	next if $hsp->frac_identical("query") < $SELF_CHECK_MIN_IDENTITY;
+	next if $hsp->frac_identical("hit") < $SELF_CHECK_MIN_IDENTITY;
+	# minimum HSP identity checks
+
+	my $ok_flank_up = 0;
+	my $ok_flank_down = 0;
+
+	breakpoint_flank_check($hsp->query_string(), $p_this, \$ok_flank_up, \$ok_flank_down);
+	breakpoint_flank_check($hsp->hit_string(), $p_other, \$ok_flank_up, \$ok_flank_down);
+	next unless $ok_flank_up and $ok_flank_down;
+	# any reason this might still be problatic??
+
+	my $found_full_length;
+	my $found_overlap;
+
+	#
+	#  check for high identity match that covers almost all
+	#  of one of the patterns:
+	#
+	my $num_identical = $hsp->num_identical();
+	my $frac_q = $num_identical / length($seq_this);
+	my $frac_s = $num_identical / length($patterns->{$hit_name}{sequence});
+	my $frac_best = max($frac_q, $frac_s);
+	# pattern lengths vary, so use the highest identity fraction
+	# vs. either sequence
+	if ($frac_best >= $SELF_CHECK_MIN_OVERLAP_FRAC_HQ) {
+	  # high overlap for the entire pattern
+	  $found_full_length = 1;
+	} elsif ($frac_best >= $SELF_CHECK_MIN_OVERLAP_FRAC_LQ) {
+	  # overlap over less of the pattern length, howeever
+	  # this may still be significant, especially for fusion
+	  # clutter cases
+	  $found_overlap = 1;
+	}
+
+	if ($found_full_length or $found_overlap) {
+	  my $this_gene_pair = $p_this->{gene_pair} || die;
+	  my $other_gene_pair = $p_other->{gene_pair} || die;
+
+	  my %r;
+	  $r{pattern} = $pid_this;
+	  $r{gene_pair} = $this_gene_pair;
+	  $r{other_pattern} = $hit_name;
+
+	  $r{other_gene_pair} = $other_gene_pair;
+
+	  $r{pattern_overlap} = sprintf "%.3f", $frac_best;
+	  $r{blast_overlap} = $hsp->length("total");
+	  $r{blast_identity} = sprintf "%.3f", $hsp->frac_identical("query");
+	  # simplified identity just for the blast overlap
+
+	  if ($found_full_length) {
+	    # high identity over entire pattern length
+	    $r{match_type} = "full_length";
+	  } elsif ($found_overlap) {
+	    # high identity over a significant sub-region
+	    my $match_type = "overlap";
+
+	    if (index($this_gene_pair, $other_gene_pair) != -1 or
+		index($other_gene_pair, $this_gene_pair) != -1) {
+	      # e.g. ASB3-PHF6-01 vs. GPR75-ASB3-PHF6-01
+	      $match_type = "fusion_clutter";
+	    }
+	    $r{match_type} = $match_type;
+	  } else {
+	    die "unimplemented";
+	  }
+
+	  $rpt->end_row(\%r);
+	}
+
+      }
+    }
+  }
+
+  $rpt->finish();
+
+}
+
+sub mask_pattern {
+  my ($seq) = @_;
+  $seq =~ tr/}{][/RYRY/;
+  return $seq;
+}
+
+sub breakpoint_flank_check {
+  my ($sequence, $p, $ref_ok_up, $ref_ok_down) = @_;
+  my $i1 = index($sequence, "R");
+  my $i2 = index($sequence, "Y");
+  my $ok = 0;
+  if ($i1 != -1 and $i2 != -1) {
+    my $b1 = $i1 + 1;
+    my $b2 = $i2 + 1;
+    my $flank_up = $b1;
+    my $flank_down = length($sequence) - $b2;
+
+    $$ref_ok_up = 1 if $flank_up >= $SELF_CHECK_MIN_FLANK;
+    $$ref_ok_down = 1 if $flank_down >= $SELF_CHECK_MIN_FLANK;
+
+    # rescue: consider a side OK if overlap covers most of that
+    # side of the pattern, e.g. ANKHD1-MIR3655-01, B side only 83 nt
+    my $seq = $p->{sequence};
+    my $pi1 = index($seq, "]");
+    $pi1 = index($seq, "}") if $pi1 == -1;
+    die if $pi1 == -1;
+
+    my $pi2 = index($seq, "[");
+    $pi2 = index($seq, "{") if $pi2 == -1;
+    die if $pi2 == -1;
+
+    my $pb1 = $pi1 + 1;
+    my $pb2 = $pi2 + 1;
+
+    my $p_flank_up = $pb1;
+    my $p_flank_down = length($seq) - $pb2;
+
+    if ($flank_up / $p_flank_up >= $SELF_CHECK_MIN_OVERLAP_FRAC_HQ) {
+      $$ref_ok_up = 1;
+    }
+
+    if ($flank_down / $p_flank_down >= $SELF_CHECK_MIN_OVERLAP_FRAC_HQ) {
+      $$ref_ok_down = 1;
+    }
+  }
+  return $ok;
+}
+
+sub pattern_self_identity_post {
+  my $f_in = $FLAGS{"pattern-self-identity-post"} || die;
+
+  my $df = new DelimitedFile("-file" => $f_in,
+			     "-headers" => 1,
+			     );
+  my $f_out = basename($f_in) . ".post.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  my %saw;
+  while (my $row = $df->get_hash()) {
+    my $key = join "/", sort @{$row}{qw(pattern other_pattern)};
+    $rpt->end_row($row) unless $saw{$key};
+    $saw{$key} = 1;
+  }
+
+  $rpt->finish();
+}
+
+sub clean_pattern_categories {
+  my $f_patterns = $FLAGS{"patterns"} || die "-patterns";
+
+  my %categories_wanted = (
+			   "GermlineSV" => 0,
+			   "circRNA" => 0,
+			   "ITD" => 1,
+			   "Admix" => 1,
+			   "NoMatch" => 1,
+			   "RareGermline" => 0,
+			   "RareLowConfidence" => 0,
+			   "ReadThrough" => 0,
+			   "GTExRecurrent" => 0,
+			   "RareSomatic" => 1,
+			   "NoReadPairDetected" => 1,
+			   "LowConfidenceEx" => 0,
+			   "ReadThroughEx" => 0,
+			   "Intragenic deletion" => 1,
+			   "BelowThreshold" => 1,
+			   "RecurrentFusion" => 1,
+			   "LowConfidence" => 0,
+			  );
+  # per JZ email 10/7/2025
+
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $f_out = basename($f_patterns) . ".category_clean.tsv";
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  while (my $row = $df->get_hash()) {
+    die unless defined $row->{category};
+    my $category = $row->{category};
+    my $usable;
+    if ($category) {
+      $usable = $categories_wanted{$category};
+      die "ERROR: no info for category $category" unless defined $usable;
+      die unless $usable == 0 or $usable == 1;
+    } else {
+      # new patterns won't have a category yet
+      $usable = 1;
+    }
+    die unless defined $usable;
+    $rpt->end_row($row) if $usable;
+  }
+
+  $rpt->finish();
+
+}
+

@@ -48,6 +48,7 @@ use ReadthroughFusionAnnotator;
 use GeneListMatcher;
 use HSPIndexer;
 use DuplicationAlignment;
+use OutfileStack;
 
 my %FLAGS;
 
@@ -83,8 +84,42 @@ my $F_GENE_B = "geneB";
 my $F_CONTIG = "contig";
 # default = CICERO-style
 my $F_FUSION;
+
+
+#
+#  standardized fields in pattern file output:
+#  TO DO: standardize all these names to $F_P_XXX and clean up
+#  references/hardcoded strings throughout code
+#
 my $F_SAMPLE = "sample";
 my $F_SOURCE = "source";
+
+my $F_P_CHR_A = 'genea_chr';
+my $F_P_POS_A = 'genea_pos';
+my $F_P_GENE_A = 'genea_symbol';
+my $F_P_FEATURE_A = 'genea_feature';
+my $F_P_ORT_A = 'genea_strand';
+my $F_P_ACC_A = 'genea_acc';
+
+my $F_P_CHR_B = 'geneb_chr';
+my $F_P_POS_B = 'geneb_pos';
+my $F_P_GENE_B = 'geneb_symbol';
+my $F_P_FEATURE_B = 'geneb_feature';
+my $F_P_ORT_B = 'geneb_strand';
+my $F_P_ACC_B = 'geneb_acc';
+
+my $F_GENE_PAIR = "gene_pair";
+my $F_GENOME = "genome";
+# genome version associated with genomic coordinates given
+my $F_PROCESSING_TYPE = "pattern_generation_method";
+my $F_GENE_PAIR_SUMMARY = "gene_pair_summary";
+my $F_GENE_PAIR_SUMMARY_EXTENDED = "gene_pair_summary_extended";
+# including genomic
+my $F_PATHOGENICITY_SOMATIC = "pathogenicity_somatic";
+my $F_P_CATEGORY = "category";
+
+# for fz2 grouping option
+
 
 my $F_ITD_FEATURES = "itd_features";
 # field only used by ITD/intragenic processing type
@@ -456,17 +491,12 @@ my $FUSION_PREFER_BEST_CONTIG_MATCHES_BEST_RELATIVE_CUTOFF = 0.95;
 # - tighten from 90 to 95% to catch ETV6-RUNX1 SJBALL032392_D1,
 #   where bogus "interstitial" result has 91% identity
 
-
-my $F_GENOME = "genome";
-# genome version associated with genomic coordinates given
-my $F_PROCESSING_TYPE = "pattern_generation_method";
-my $F_GENE_PAIR_SUMMARY = "gene_pair_summary";
-my $F_GENE_PAIR_SUMMARY_EXTENDED = "gene_pair_summary_extended";
-# including genomic
-my $F_PATHOGENICITY_SOMATIC = "pathogenicity_somatic";
-
-my $F_GENE_PAIR = "gene_pair";
-# for fz2 grouping option
+my %IUPAC_mask = (
+		  "N" => "A",
+		  # hack
+		 );
+# https://www.bioinformatics.org/sms/iupac.html
+# TO DO: add additional entries once encountered
 
 my @H_FZ2_CLONE = (
 		   $F_GENOME,
@@ -476,11 +506,13 @@ my @H_FZ2_CLONE = (
 		      genea_feature
 		      genea_chr
 		      genea_pos
+		      genea_strand
 		      geneb_symbol
 		      geneb_acc
 		      geneb_feature
 		      geneb_chr
 		      geneb_pos
+		      geneb_strand
 		    ),
 		   $F_GENE_PAIR_SUMMARY,
 		   $F_GENE_PAIR_SUMMARY_EXTENDED,
@@ -489,6 +521,7 @@ my @H_FZ2_CLONE = (
 		  );
 # fields copied verbatim from fz2 intermediate file format into final
 # pattern file.
+# - strand: may be used by some downstream applications, e.g. oncoprint
 
 my @H_FZ2_CORE = (
 		  $F_PATTERN_ID,
@@ -612,6 +645,7 @@ my @clopts = (
 
 	      "-diagnose-matches=s",
 	      "-patterns=s",
+	      "-patterns-restrict=s",
 
 	      "-genomic",
 	      "-crest",
@@ -740,6 +774,7 @@ my @clopts = (
 	      "-generate-transcript-info",
 
 	      "-patch-breakpoints=s",
+	      # requires .pattern.tab files (fragile)
 
 	      "-soft-clip-to-pattern",
 	      "-sam=s",
@@ -747,6 +782,11 @@ my @clopts = (
 	      "-merge-patterns",
 	      "-f-patterns=s" => \@PATTERN_FILES,
 	      # fz2.tab pattern files
+	      "-f-pattern-list=s",
+	      # listfile of pattern files
+	      "-merge-ok",
+	      "-blast-first",
+
 	      "-f-src=s" => \@SRC_FILES,
 	      # source files for fz2.tab pattern files
 	      "-header-policy=s",
@@ -802,9 +842,32 @@ my @clopts = (
 	      "-restrict-source=s",
 
 	      "-patch-gene-pair-summary",
+	      "-patch-gene-pair-summary-extended",
 	      "-patch-gene-pair",
+	      "-patch-genome=s",
 
 	      "-show-module-dependencies",
+
+	      "-mask-ambiguity-codes=s",
+
+	      "-convert-xiaotu-synthetic=s",
+
+	      "-exon2pattern=s",
+	      "-all-combinations",
+
+	      "-detect-interstitial-coding",
+
+	      "-annotation-patch",
+
+	      "-patch-strand",
+
+	      "-missing-field-report",
+
+	      "-patch-category",
+	      "-category-fusion=s",
+	      "-category-itd=s",
+	      "-ignore-errors",
+
 	     );
 GetOptions(
 	   \%FLAGS,
@@ -909,8 +972,36 @@ if ($FLAGS{"gencode2refflat"}) {
 } elsif ($FLAGS{"patch-gene-pair-summary"}) {
   patch_gene_pair_summary();
   exit(0);
+} elsif ($FLAGS{"patch-gene-pair-summary-extended"}) {
+  patch_gene_pair_summary_extended();
+  exit(0);
 } elsif ($FLAGS{"patch-gene-pair"}) {
   patch_gene_pair();
+  exit(0);
+} elsif ($FLAGS{"mask-ambiguity-codes"}) {
+  mask_ambiguity_codes();
+  exit(0);
+} elsif ($FLAGS{"exon2pattern"}) {
+  exon2pattern();
+  exit(0);
+} elsif ($FLAGS{"detect-interstitial-coding"}) {
+  detect_interstitial_coding();
+  exit(0);
+} elsif ($FLAGS{"annotation-patch"}) {
+  # meta-patcher
+  annotation_patch();
+  exit(0);
+} elsif ($FLAGS{"patch-genome"}) {
+  patch_genome();
+  exit(0);
+} elsif ($FLAGS{"patch-strand"}) {
+  strand_patch();
+  exit(0);
+} elsif ($FLAGS{"missing-field-report"}) {
+  report_missing_fields();
+  exit(0);
+} elsif ($FLAGS{"patch-category"}) {
+  patch_category();
   exit(0);
 }
 
@@ -929,6 +1020,9 @@ my @NEW_HEADERS = (
 		   qw(
 		       genea_symbol
 		       genea_acc
+		       genea_chr
+		       genea_pos
+		       genea_strand
 		       genea_acc_preferred
 		       genea_pos_adj
 		       genea_coding_distance
@@ -936,6 +1030,10 @@ my @NEW_HEADERS = (
 
 		       geneb_symbol
 		       geneb_acc
+		       geneb_chr
+		       geneb_pos
+		       geneb_strand
+
 		       geneb_acc_preferred
 		       geneb_pos_adj
 		       geneb_coding_distance
@@ -1051,6 +1149,9 @@ if (my $info = $FLAGS{"generate-test-file"}) {
   exit(0);
 } elsif ($FLAGS{"patch-features"}) {
   patch_features();
+  exit(0);
+} elsif ($FLAGS{"convert-xiaotu-synthetic"}) {
+  convert_xiaotu_synthetic();
   exit(0);
 }
 
@@ -1168,16 +1269,23 @@ while (my $row = $df->get_hash()) {
     my %r = %{$row};
     $r{$F_GENOME} = standardize_genome($FLAGS{genome} || die "-genome");
     $r{input_row_number} = $input_row_number;
+
     $r{genea_acc} = "";
     $r{genea_acc_preferred} = "";
     $r{genea_symbol} = "";
+    $r{genea_chr} = "";
+    $r{genea_pos} = "";
     $r{genea_pos_adj} = "";
+    $r{genea_strand} = "";
     $r{genea_coding_distance} = "";
     $r{genea_feature} = "";
     $r{geneb_acc} = "";
     $r{geneb_acc_preferred} = "";
     $r{geneb_symbol} = "";
+    $r{geneb_chr} = "";
+    $r{geneb_pos} = "";
     $r{geneb_pos_adj} = "";
+    $r{geneb_strand} = "";
     $r{geneb_coding_distance} = "";
     $r{geneb_feature} = "";
     $r{genea_full} = "";
@@ -1969,6 +2077,10 @@ while (my $row = $df->get_hash()) {
 
 	  $r{geneb_feature} = $is_suppl_b ? VALUE_NA : get_feature_tag($rf, $rf_b, $pos_b_adj);
 	}
+
+
+	$r{$F_P_ORT_A} = $row->{$F_ORT_A} || dump_die($row, "no $F_ORT_A");
+	$r{$F_P_ORT_B} = $row->{$F_ORT_B} || dump_die($row, "no $F_ORT_A");
 
 	$r{geneb_acc} = $acc_b;
 	$r{geneb_acc_preferred} = get_sjpi($SJPI, $acc_b);
@@ -3164,7 +3276,7 @@ sub convert_fuzzion {
     foreach my $pid (sort keys %pattern_seq) {
       my %r;
       $r{pattern} = $pid;
-      $r{sequence} = $pattern_seq{$pid};
+      $r{sequence} = mask_iupac($pattern_seq{$pid});
 
       if ($REPORT_SOURCE) {
 	$r{source} = join ",", sort keys %{$pattern_annot{$pid}{source}};
@@ -3281,7 +3393,16 @@ sub transcript_filter {
 	# OK: preferred isoform available in our transcript set
 	$nm = $pref;
       } else {
-	die "isoform filter failure for $gene, can't filter to $pref, no data\n";
+	# try unversioned match
+	foreach my $acc (keys %{$transcript2nm}) {
+	  my $unv = $acc;
+	  $unv =~ s/\.\d+$//;
+	  if ($unv eq $pref) {
+	    $nm = $acc;
+	  }
+	}
+
+	die "isoform filter failure for $gene, can't filter to $pref, no data\n" unless $nm;
       }
     }
   }
@@ -4733,7 +4854,7 @@ sub generate_rna_contigs {
 
   field_preset_setup();
 
-  die "chr/pos/ort fields not defined; suggest using -cicero, -crest, etc." unless ($F_CHR_A and $F_POS_A and $F_CHR_B and $F_POS_B);
+  die "chr/pos/ort fields not defined; suggest using -cicero, -crest, etc." unless ($F_CHR_A and $F_POS_A and $F_ORT_A and $F_CHR_B and $F_POS_B and $F_ORT_B);
 
   my $genome = standardize_genome($FLAGS{genome} || die "-genome");
 
@@ -4965,6 +5086,7 @@ sub generate_rna_contigs {
 
 	my %r = %{$row};
 	$r{input_row_number} = $input_row_number;
+	$r{input_row_md5} = $input_row_md5 || die;
 	$r{genea_acc} = $acc_a;
 	$r{genea_symbol} = $transcript2gene{$acc_a} || die;
 	$r{$F_NOTES} = join ",", @notes_general, @problem;
@@ -5147,7 +5269,7 @@ sub generate_rna_contigs {
 	  }
 
 	  $r{input_row_number} = $input_row_number;
-	  $r{input_row_md5} = $input_row_md5;
+	  $r{input_row_md5} = $input_row_md5 || die "no md5";
 	  $r{genea_acc} = $acc_a;
 	  $r{genea_symbol} = $transcript2gene{$acc_a} || die;
 	  $r{genea_pos} = $r{genea_pos_adj} = $pos_a;
@@ -5161,6 +5283,8 @@ sub generate_rna_contigs {
 	  $r{$F_NOTES} = join ",", @notes_general, @problem, @notes_b;
 	  $r{genea_chr} = $chr_a;
 	  $r{geneb_chr} = $chr_b;
+	  $r{$F_P_ORT_A} = $ort_a;
+	  $r{$F_P_ORT_B} = $ort_b;
 
 	  return \%r;
 	};
@@ -5260,6 +5384,9 @@ sub generate_rna_contigs {
 	}
 	$row->{geneb_pos} = $row->{geneb_pos_adj} = $pos_b;
 	$row->{geneb_chr} = $chr_b;
+
+	$row->{$F_P_ORT_A} = $ort_a;
+	$row->{$F_P_ORT_B} = $ort_b;
 
 	$row->{input_row_number} = $input_row_number;
 	$row->{input_row_md5} = $input_row_md5;
@@ -5854,6 +5981,18 @@ sub condense_patterns {
 #      $PATTERN_CONDENSE_MAX_BREAKPOINT_DRIFT_FUSION = 10;
   }
 
+  my $blast = get_blast();
+
+  if (1) {
+    my $limit_seqs = 25;
+    printf STDERR "duplicate-checking configuration:\n";
+    printf STDERR "  limiting target seqs to %d\n", $limit_seqs;
+#    printf STDERR "  limiting seqs to %d, HSPs to %d\n", $limit_seqs, $limit_hsps;
+
+    $blast->max_target_seqs($limit_seqs);
+#    $blast->max_hsps($limit_hsps);
+  }
+
   my $df = new DelimitedFile("-file" => $infile,
 			     "-headers" => 1,
 			     );
@@ -6026,8 +6165,6 @@ sub condense_patterns {
       }
     }
   }
-
-  my $blast = get_blast();
 
   #
   # identify duplicates within gene pairings:
@@ -7619,10 +7756,10 @@ sub condense_from_report {
   my ($report) = @_;
 
   my $glob = $FLAGS{"condense-pattern-annot-glob"} || "*.pattern.tab";
-  my @pattern_annot_files = glob($glob);
-
-  unless (@pattern_annot_files) {
-    die "no .pattern.tab files" unless $FLAGS{"condense-no-pattern-files"};
+  my @pattern_annot_files;
+  unless ($FLAGS{"condense-no-pattern-files"}) {
+    @pattern_annot_files = glob($glob);
+    die "no .pattern.tab files" unless @pattern_annot_files;
   }
 
   my $df = new DelimitedFile("-file" => $report,
@@ -8346,6 +8483,8 @@ sub parse_cosmic {
 }
 
 sub generate_pair_summary {
+  # generate gene pair summary and extended version for a SINGLE input row.
+  # not to be used with postprocessed/merged data!
   my ($r) = @_;
   my $summary_a = join "/", @{$r}{qw(genea_symbol genea_acc genea_feature)};
   my $summary_b = join "/", @{$r}{qw(geneb_symbol geneb_acc geneb_feature)};
@@ -10065,11 +10204,14 @@ sub add_preferred_key {
 		  gte_B_exon
 		  gte_rank
 		  gte_key
-	       );
+		);
+
+  my $h_needed = detect_needed_headers($df, \@f_new);
+  # also work in a patch mode
 
   my $rpt = $df->get_reporter(
 			      "-file" => $outfile,
-			      "-extra" => \@f_new,
+			      "-extra" => $h_needed,
   			      "-auto_qc" => 1,
 			     );
   # can't necessarily rely on existing gene A/B symbols, as these
@@ -10824,6 +10966,8 @@ sub itd2fuzzion {
 	$r{geneb_chr} = "";
 	$r{genea_pos} = "";
 	$r{geneb_pos} = "";
+	$r{genea_strand} = "";
+	$r{geneb_strand} = "";
       } elsif ($cicero_mode) {
 	$r{genea_chr} = $r{chrA} || die "no chrA";
 	$r{geneb_chr} = $r{chrB} || die "no chrB";
@@ -12619,9 +12763,19 @@ sub merge_pattern_files {
   #  - unique-ify pattern IDs
   #  - harmonize output format by merging to core/shared columns only
   #  - write pattern.tab files?
+  #
   # output can then be run through "condense" process
+  # OR: maybe add some basic BLAST duplicate-checking here?
 
-  my $header_policy = $FLAGS{"header-policy"} || die "-header-policy [core|first|clone]";
+  my $header_policy = $FLAGS{"header-policy"} || die "-header-policy [first|first_and_core|core|clone]";
+  # first_and_core recommended
+  my $blast_first = $FLAGS{"blast-first"};
+
+  if (my $f_list = $FLAGS{"f-pattern-list"}) {
+    my $set = read_simple_file($f_list);
+    push @PATTERN_FILES, @{$set};
+  }
+  die "no pattern files!" unless @PATTERN_FILES;
 
   my @infiles = @PATTERN_FILES;
   foreach my $f_list (@SRC_FILES) {
@@ -12649,6 +12803,21 @@ sub merge_pattern_files {
 			       "-headers" => 1,
 			      );
     $h_out = $df->headers_raw();
+  } elsif ($header_policy eq "first_and_core") {
+    # follow the format of the first file specified,
+    # but also ensure latest core fields are included
+    my $df = new DelimitedFile("-file" => $infiles[0],
+			       "-headers" => 1,
+			      );
+    $h_out = [ @{$df->headers_raw()} ];
+    # copy as may be appended to
+    my %have = map {$_, 1} @{$h_out};
+    foreach my $h (@H_FZ2_CORE) {
+      unless ($have{$h}) {
+	printf STDERR "WARNING: adding missing core header %s\n", $h;
+	push @{$h_out}, $h;
+      }
+    }
   } elsif ($header_policy eq "clone") {
     my $df = new DelimitedFile(
 			       "-file" => ($FLAGS{patterns} || die "-patterns"),
@@ -12659,6 +12828,18 @@ sub merge_pattern_files {
     die "-header-policy must be core|first|clone";
   }
   die unless $h_out;
+
+  #
+  #  data QC for files to be merged:
+  #
+  foreach my $f (@PATTERN_FILES) {
+    missing_field_report($f, $h_out);
+  }
+
+  unless ($FLAGS{"merge-ok"}) {
+    printf STDERR "specify -merge-ok to confirm.\n";
+    exit(1);
+  }
 
   my $f_out = $FLAGS{out} || "merged.tab";
 
@@ -12676,6 +12857,7 @@ sub merge_pattern_files {
   my $prepend_secondary = $FLAGS{"prepend-secondary"};
 
   my $file_count = 0;
+  my %missing_fields;
   foreach my $f_in (@infiles) {
     my $df = new DelimitedFile("-file" => $f_in,
 			       "-headers" => 1,
@@ -12724,7 +12906,10 @@ sub merge_pattern_files {
 	# output follows the format of the first file.
 	# populate any columns not specified in other files with blanks.
 	foreach my $h (@{$h_out}) {
-	  $row->{$h} = "" unless exists $row->{$h};
+	  unless (exists $row->{$h}) {
+	    $missing_fields{$h}++;
+	    $row->{$h} = "";
+	  }
 	}
       }
 
@@ -12737,10 +12922,30 @@ sub merge_pattern_files {
 	}
       }
 
-      if ($is_secondary and $prepend_secondary) {
-	push @out_prepend, $row;
-      } else {
-	push @out_main, $row;
+      my $usable = 1;
+
+      if ($is_secondary and $blast_first) {
+	my $is_dup = blast_dupcheck($row, $infiles[0]);
+	if ($is_dup) {
+	  printf STDERR "skipping %s: duplicate of %s\n",
+	    $row->{pattern}, $is_dup;
+	  $usable = 0;
+	}
+      }
+
+      if ($usable) {
+	foreach my $h (@{$h_out}) {
+	  unless (exists $row->{$h}) {
+	    # add padding/blank columns if necessary
+	    $row->{$h} = "";
+	  }
+	}
+
+	if ($is_secondary and $prepend_secondary) {
+	  push @out_prepend, $row;
+	} else {
+	  push @out_main, $row;
+	}
       }
     }
     $rpt_pattern->finish();
@@ -12763,6 +12968,11 @@ sub merge_pattern_files {
   $rpt->finish();
   # merged file
 
+  if (%missing_fields) {
+    foreach my $f (sort keys %missing_fields) {
+      printf STDERR "field %s: %d records with missing value\n", $f, $missing_fields{$f};
+    }
+  }
 
 }
 
@@ -12788,6 +12998,7 @@ sub cicero_clone_patch {
 	     "geneb_chr" => [ "chrB" ],
 	     "geneb_pos" => [ "geneb_pos_adj", "posB" ],
 	    );
+  confess "FIX ME: also clone ortA/B to strand fields!";
   foreach my $f_out (keys %map) {
     unless (exists $row->{$f_out}) {
       my $set_in = $map{$f_out} || die;
@@ -13557,8 +13768,12 @@ sub filter_by_contig_identity {
       $si = si_merge_range($si, $r, "genea_contig_start", "genea_contig_end");
       $si = si_merge_range($si, $r, "geneb_contig_start", "geneb_contig_end");
       my $overlap_size = size $si;
-      my $contig = $r->{contig} || die;
-      $r->{$f_identity_frac} = $overlap_size / length($contig);
+      my $identity_frac = 0;
+      if (my $contig = $r->{contig}) {
+	# won't be present for exception records
+	$identity_frac = $overlap_size / length($contig);
+      }
+      $r->{$f_identity_frac} = $identity_frac;
 #      printf STDERR "identity: %f\n", $r->{$f_identity_frac};
     }
 
@@ -13975,6 +14190,8 @@ sub detect_needed_headers {
 sub patch_gene_pair_summary {
   # patch records missing gene_pair_summary field.
   # requires all (non-merged) summary annotations.
+  #
+  # TO DO: possibly handle gene_pair_summary_extended as well?
   my $f_patterns = $FLAGS{patterns} || die "-patterns";
   my $f_out = basename($f_patterns) . ".gps.tab";
 
@@ -13999,7 +14216,7 @@ sub patch_gene_pair_summary {
   			      "-auto_qc" => 1,
 			     );
 
-  my $f_gps = "gene_pair_summary";
+  my $f_gps = $F_GENE_PAIR_SUMMARY;
 
   my @pair_elements = qw(
 		     symbol
@@ -14110,4 +14327,1017 @@ sub populate_gene_pair {
   my $pid = $row->{pattern};
   my $pair = pid2pair($pid);
   $row->{$F_GENE_PAIR} = $pair;
+}
+
+sub mask_ambiguity_codes {
+  my ($f_patterns) = $FLAGS{"mask-ambiguity-codes"};
+  # https://www.bioinformatics.org/sms/iupac.html
+  # fuzzion2 2.0 won't allow any characters other than ACGT in
+  # pattern sequence.
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $outfile = basename($f_patterns) . ".ambig_mask.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $outfile,
+  			      "-auto_qc" => 1,
+			     );
+
+  my $updated = 0;
+  while (my $row = $df->get_hash()) {
+    my $seq = $row->{sequence};
+    my $seq_orig = $seq;
+    $seq = mask_iupac($seq);
+    if ($seq ne $seq_orig) {
+#      die "hey now:\n$seq_orig\n$seq\n";
+      $row->{sequence} = $seq;
+      $updated++;
+    }
+
+    if ($seq =~ /([^ACGT\[\]\{\}])/) {
+      die sprintf "ERROR: illegal non-ACGT nucleotide code %s found in pattern sequence %s", $1, $seq;
+    }
+
+    $rpt->end_row($row);
+  }
+
+  $rpt->finish();
+  printf STDERR "updated: %d\n", $updated;
+}
+
+sub mask_iupac {
+  my ($seq) = @_;
+  foreach my $from (keys %IUPAC_mask) {
+    my $to = $IUPAC_mask{$from};
+    $seq =~ s/$from/$to/g;
+  }
+  return $seq;
+}
+
+sub convert_xiaotu_synthetic {
+  my $f_in = $FLAGS{"convert-xiaotu-synthetic"} || die;
+  my $genome = $FLAGS{genome} || die "-genome";
+  # the version of this sheet I've seen is hg38 but not sure
+  # that's always true
+
+  my $df = new DelimitedFile(
+			     "-file" => $f_in,
+			     "-headers" => 1,
+			    );
+  my $f_out = basename($f_in) . ".patterns.tab";
+
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => \@H_FZ2_CORE,
+			 "-auto_qc" => 1,
+			);
+
+  my %pid_counter;
+
+  while (my $row = $df->get_hash()) {
+    my $genomic = $row->{fusion_junction_genome_pos};
+    my @f = split /\./, $genomic;
+    die unless @f == 6;
+    my %r;
+    @r{$F_P_CHR_A, $F_P_POS_A, $F_P_ORT_A,
+	 $F_P_CHR_B, $F_P_POS_B, $F_P_ORT_B} = @f;
+    # NOTE: these are hg38 coordinates
+
+    my $geneA = $row->{geneN} || die;
+    my $geneB = $row->{geneC} || die;
+    $r{$F_P_GENE_A} = $geneA;
+    $r{$F_P_GENE_B} = $geneB;
+    $r{$F_GENE_PAIR} = join "-", $geneA, $geneB;
+
+    my $pair = join "-", $geneA, $geneB;
+    my $pid = sprintf "%s-%02d", $pair, ++$pid_counter{$pair};
+    $r{$F_PATTERN_ID} = $pid;
+
+    my $seq = $row->{long_fusion_contig} || die;
+    $seq =~ s/_/\]\[/ || die;
+    $r{$F_PATTERN_SEQUENCE} = $seq;
+
+    my $fi = $row->{frame_info} || die;
+    @f = split /;/, $fi;
+
+    if ($f[1] =~ /^E(\d+)_(\d+$)$/) {
+      $r{$F_P_FEATURE_A} = sprintf 'exon_%d', $1;
+      $r{$F_P_FEATURE_B} = sprintf 'exon_%d', $2;
+    } else {
+      die "exon format error " . $f[1];
+    }
+
+    $r{$F_P_ACC_A} = $row->{refseq_N} || die;
+    $r{$F_P_ACC_B} = $row->{refseq_C} || die;
+
+    $r{$F_SOURCE} = file_to_source($f_in);
+    $r{$F_SAMPLE} = "";
+    # or maybe a tag like "synthetic"?  But "source" tag is
+    # probably sufficient for that purpose
+    $r{$F_GENOME} = standardize_genome($genome);
+
+    generate_pair_summary(\%r);
+
+    $r{$F_PROCESSING_TYPE} = "contig_conversion";
+    $r{$F_PATHOGENICITY_SOMATIC} = "";
+
+    $rpt->end_row(\%r);
+  }
+  $rpt->finish();
+}
+
+sub exon2pattern {
+  my $f_in = $FLAGS{exon2pattern} || die;
+  init_sjpi();
+
+  my $df = new DelimitedFile("-file" => $f_in,
+			     "-headers" => 1,
+			    );
+
+  my $f_out = basename($f_in) . ".fz2.tab";
+
+  my $rpt = new Reporter(
+			 "-file" => $f_out,
+			 "-delimiter" => "\t",
+			 "-labels" => \@H_FZ2_CORE,
+			 "-auto_qc" => 1,
+			);
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+
+  my $combo_mode = $FLAGS{"all-combinations"};
+
+  my %pid_count;
+  while (my $row = $df->get_hash()) {
+
+    my @combinations;
+    if ($combo_mode) {
+      my $ec_a = get_exon_count($row, "5");
+      my $ec_b = get_exon_count($row, "3");
+      # NM_001127387.2
+      die "no exons for 5' gene" unless $ec_a;
+      die "no exons for 3' gene" unless $ec_b;
+
+      foreach my $ex_a (1 .. $ec_a) {
+	foreach my $ex_b (1 .. $ec_b) {
+	  push @combinations, [ $ex_a, $ex_b ];
+	}
+      }
+    } else {
+      push @combinations, "bogus";
+    }
+    die "ERROR: no exon combinations!" unless @combinations;
+
+    foreach my $combo (@combinations) {
+      if ($combo_mode) {
+	$row->{exon_5} = $combo->[0];
+	$row->{exon_3} = $combo->[1];
+      }
+
+      my ($seq_up, $acc_a, $exon_a) = get_exon_chunk($row, "5");
+      my ($seq_down, $acc_b, $exon_b) = get_exon_chunk($row, "3");
+
+      my $gene_a = $row->{gene_5} || die;
+      my $gene_b = $row->{gene_3} || die;
+
+      my $gene_pair = join "-", $gene_a, $gene_b;
+
+      my $pid = sprintf '%s-%02d', $gene_pair, ++$pid_count{$gene_pair};
+
+      my $sequence = join "", $seq_up, BREAKPOINT_FUSION_LEFT, BREAKPOINT_FUSION_RIGHT, $seq_down;
+
+      $row->{$F_PATTERN_ID} = $pid;
+      $row->{$F_PATTERN_SEQUENCE} = $sequence;
+      $row->{$F_GENE_PAIR} = $gene_pair;
+      $row->{$F_SOURCE} = file_to_source($f_in);
+      $row->{$F_GENOME} = 37;
+      # hack/NA
+
+      $row->{$F_P_GENE_A} = $gene_a;
+      $row->{$F_P_ACC_A} = $acc_a;
+      $row->{$F_P_FEATURE_A} = sprintf 'exon_%d', $exon_a;
+
+      $row->{$F_P_GENE_B} = $gene_b;
+      $row->{$F_P_ACC_B} = $acc_b;
+      $row->{$F_P_FEATURE_B} = sprintf 'exon_%d', $exon_b;
+      $row->{$F_PROCESSING_TYPE} = "exon2pattern";
+      $row->{$F_SAMPLE} = $row->{sample} || "";
+      # optional but helpful if known (e.g. Archer comparison)
+
+      #    generate_pair_summary($row);
+      # can't do this without genomic coordinates; do later?
+
+      foreach my $f_blank (
+			   $F_PATHOGENICITY_SOMATIC,
+
+			   $F_P_CHR_A,
+			   $F_P_CHR_B,
+			   $F_P_POS_A,
+			   $F_P_POS_B,
+			   $F_P_ORT_A,
+			   $F_P_ORT_B,
+			   $F_GENE_PAIR_SUMMARY,
+			   $F_GENE_PAIR_SUMMARY_EXTENDED,
+			   # use standard patching code for these later?
+			  ) {
+	$row->{$f_blank} = "";
+      }
+
+      $rpt->end_row($row);
+    }
+  }
+  $rpt->finish();
+
+}
+
+sub get_exon_chunk {
+  my ($row, $end) = @_;
+  my $f_gene = sprintf "gene_%d", $end;
+  my $f_exon = sprintf "exon_%d", $end;
+
+  my $gene = $row->{$f_gene} || die;
+  my $exon = $row->{$f_exon} || die;
+
+  my $nm = $SJPI->get_preferred_isoform($gene) || die "no sjpi for $gene";;
+
+  my $gbc = new GenBankCache();
+  my $f_gb = $gbc->get($nm)->[0];
+
+#  printf STDERR "GB: %s\n", $f_gb;
+  my $cds = new GenBankCDS("-file" => $f_gb);
+  my $exon_info = $cds->exon2bases->{$exon} || die "no exon info for $exon";
+
+  my $mrna = $cds->genbank_info->{mrna_full} || die;
+
+  my $chunk;
+  if ($end eq "5") {
+    # upstream/N-terminal/A: start of sequence to end of target exon
+    $chunk = substr($mrna, 0, $exon_info->{end});
+    if (length($chunk) > $EXTENDED_CHUNK_LENGTH) {
+      $chunk = substr($chunk, - $EXTENDED_CHUNK_LENGTH);
+    }
+  } elsif ($end eq "3") {
+    # downstream/C-terminal/B: start of target exon to end
+    $chunk = substr($mrna, $exon_info->{start} - 1);
+    if (length($chunk) > $EXTENDED_CHUNK_LENGTH) {
+      $chunk = substr($chunk, 0, $EXTENDED_CHUNK_LENGTH);
+    }
+  } else {
+    die "invalid end: must be either 5 or 3";
+  }
+
+  return ($chunk, $nm, $exon);
+}
+
+sub get_exon_count {
+  my ($row, $end) = @_;
+  my $f_gene = sprintf "gene_%d", $end;
+
+  my $gene = $row->{$f_gene} || die;
+
+  my $nm = $SJPI->get_preferred_isoform($gene) || die "no sjpi for $gene";;
+
+  my $gbc = new GenBankCache();
+  my $f_gb = $gbc->get($nm)->[0];
+
+#  printf STDERR "GB: %s\n", $f_gb;
+  my $cds = new GenBankCDS("-file" => $f_gb);
+  my $exon_info = $cds->exon2bases() || die "no exon info for $nm";
+  return scalar keys %{$exon_info};
+}
+
+sub detect_interstitial_coding {
+  # repair routine to find old bad patterns where "interstitial" sequence
+  # is actually coding in a different isoform pair.  While bug has been
+  # fixed, some existing patterns are affected.
+  my $min_ilen = 30;
+  my $min_identity = 0.99;
+
+  my $f_patterns = $FLAGS{patterns} || die;
+  my $pattern = $FLAGS{pattern};
+  # debug
+  my $rf = get_refflat();
+  my $pid2ilen = get_pattern2ilen($f_patterns, 1);
+
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $f_out = basename($f_patterns) . ".interstitial_ok.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  my $gbc = new GenBankCache();
+  my $blast = get_blast();
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  while (my $row = $df->get_hash()) {
+    my $pid = $row->{pattern} || die;
+    my $interstitial = $pid2ilen->{$pid};
+    die "no ilen" unless defined $interstitial;
+    my $ilen = length($interstitial);
+    my $usable = 1;
+    my $geneA_sym = $row->{genea_symbol} || die;
+    my $geneB_sym = $row->{geneb_symbol} || die;
+
+    my $check = ($ilen >= $min_ilen and $geneA_sym ne $geneB_sym);
+    # fusions only, assume ITDs OK
+    $check = 0 if $pattern and $pid ne $pattern;
+
+    if ($check) {
+      my %query;
+      $query{interstitial} = $interstitial;
+
+    FIELD:
+      foreach my $field (qw(genea_symbol geneb_symbol)) {
+	# get accessions for both genes:
+	my $gene = $row->{$field} || die;
+	my $rows = $rf->find_by_gene($gene) || die;
+	foreach my $row (@{$rows}) {
+	  my $acc = $row->{name};
+	  if ($acc =~ /^NM_/) {
+	    # coding only for this code
+	    #	    printf STDERR "%s: %s\n", $gene, $acc;
+	    my $f_gb = $gbc->get_cache_file($acc) || die;
+
+	    my $gbc = new GenBankCDS("-file" => $f_gb);
+	    my $info = $gbc->get_info();
+	    my $acc = $info->{accession_versioned} || dump_die($row, "no accession_versioned");
+	    my $mrna_full = $info->{mrna_full} || die "no mrna_cds";
+	    my %db;
+	    $db{$acc} = $mrna_full;
+
+
+	    my @hsps = blast2hsps(
+				  "-blast" => $blast,
+				  "-query" => \%query,
+				  "-database" => \%db
+				 );
+
+	    foreach my $hsp (@hsps) {
+	      my $fi = $hsp->frac_identical("query");
+	      if ($fi >= $min_identity) {
+		printf STDERR "%s: disqualifying match of %s to %s\n", $pid, $interstitial, $acc;
+		$usable = 0;
+		last FIELD;
+	      }
+	    }
+	  }
+	}
+      }
+    }
+    if ($usable) {
+      printf STDERR "%s: pattern OK\n", $pid if $check;
+      $rpt->end_row($row);
+    }
+  }
+
+  $rpt->finish();
+}
+
+sub get_pattern2ilen {
+  #
+  #  generate map of pattern name -> interstitial bases count
+  #
+  my ($f_patterns, $return_sequence) = @_;
+  die unless $f_patterns;
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			    );
+
+  my %pattern2ilen;
+  while (my $row = $df->get_hash()) {
+    my $pid = $row->{pattern} || die;
+    my $seq = $row->{sequence} || die;
+
+    foreach my $style (
+		       [ "]", "[" ],
+		       [ "}", "{" ]
+		      ) {
+      my ($c1, $c2) = @{$style};
+      my $i1 = index($seq, $c1);
+      my $i2 = index($seq, $c2);
+      if ($i1 != -1 and $i2 != -1) {
+	die unless $i2 > $i1;
+	my $len = ($i2 - $i1) - 1;
+	if ($return_sequence) {
+	  my $result;
+	  if ($len == 0) {
+	    $result = "";
+	  } else {
+	    $result = substr($seq, $i1 + 1, $len);
+	  }
+	  $pattern2ilen{$pid} = $result;
+	} else {
+	  $pattern2ilen{$pid} = $len;
+	}
+      }
+    }
+  }
+  return \%pattern2ilen;
+}
+
+sub blast_dupcheck {
+  my ($row, $db) = @_;
+  my $verbose = 1;
+  my $limit_seqs = 10;
+
+  my $db_fa = $db . ".fa";
+  unless (-s $db_fa) {
+    die "where is $db_fa";
+    # fz2_utils.pl -pattern2fasta
+  }
+
+  my $pid_this = $row->{pattern} || die;
+  my $seq_this = $row->{sequence} || die;
+  $seq_this =~ tr/[]{}/NNNN/;
+  my $length_this = length($seq_this);
+  printf STDERR "duplicate-checking %s...\n", $pid_this;
+
+  my $tfw = new TemporaryFileWrangler();
+  my $f_query = $tfw->get_tempfile("-append" => ".query.fa");
+
+  my $blast = new BLASTer();
+  $blast->blast_2_sequences(1);
+  $blast->output_format("xml");
+  $blast->max_target_seqs($limit_seqs);
+
+  unlink($f_query);
+  write_fasta($f_query, { $pid_this => $seq_this });
+
+  my $parser = $blast->blast(
+			     "-query" => $f_query,
+			     "-database" => $db_fa
+			      );
+  my $result = $parser->next_result;
+  # one object per query sequence (only one query seq)
+
+  my $is_duplicate;
+
+  if ($result) {
+    while (my $hit = $result->next_hit()) {
+      my $hit_name = $hit->name();
+
+      my $hsp = $hit->next_hsp();
+      # can be more than one HSP per hit, however for this application
+      # we're only interested in single-HSP hits
+
+      printf STDERR "    score:%s name:%s strand:%s q:%d-%d subj:%d-%d num_identical:%d frac_identical_query:%s frac_identical_hit:%s query_span:%d ref_span:%d total_span=%d query_string=%s hit_string=%s\n",
+	$hsp->score,
+	$hit->name,
+	$hsp->strand,
+	$hsp->range("query"),
+	$hsp->range("hit"),
+	$hsp->num_identical(),
+	$hsp->frac_identical("query"),
+	$hsp->frac_identical("hit"),
+	$hsp->length("query"),
+	$hsp->length("hit"),
+	$hsp->length("total"),
+	$hsp->query_string(),
+	$hsp->hit_string() if $verbose;
+
+
+      my ($span_start, $span_end) = $hsp->range("query");
+      my $span_q = ($span_end - $span_start) + 1;
+      my $frac_q = $span_q / length($seq_this);
+      next if $frac_q < $PATTERN_CONDENSE_MIN_QUERY_OVERLAP_FRAC;
+      # overlap requirement met
+
+      next if $hsp->frac_identical("query") < $PATTERN_CONDENSE_MIN_BLAST_FRAC_IDENTICAL;
+      # identity requirement met
+
+      $is_duplicate = $hit_name;
+      last;
+    }
+  }
+  return $is_duplicate;
+}
+
+sub write_fasta {
+  my ($f_out, $db) = @_;
+  unlink $f_out;
+  my $wf = new WorkingFile($f_out);
+  my $fh = $wf->output_filehandle();
+  foreach my $id (sort keys %{$db}) {
+    printf $fh ">%s\n%s\n", $id, $db->{$id};
+  }
+  $wf->finish();
+}
+
+sub annotation_patch {
+  #
+  # add/patch standard pattern annotations
+  #
+  # TO DO:
+  # - report counts of added annotation by column!
+  # - report final counts of missing annoations and how important
+  #   these are: some should always be populated, others may never be, e.g.:
+  #     sample
+  #     pathogenicity_somatic
+  #     pattern_generation_method
+  #
+  my $f_in = $FLAGS{patterns} || die "patterns";
+  find_binary("mux.pl", "-die" => 1);
+  find_binary("blastn", "-die" => 1);
+  find_binary("gfClient", "-die" => 1);
+  # blat/3.5
+
+  # some values are not guaranteed to be populated:
+
+  #
+  #  temporary hacks:
+  #
+  my $f_transcriptome_fasta = "/research/rgs01/home/clusterHome/medmonso/work/steve/2020_06_13_cicero_contig_extension/2021_01_04_all/blast/mappability/refgene2protein/refseq.fa";
+  my $f_refflat = "/home/medmonso/work/steve/2020_06_13_cicero_contig_extension/2021_01_04_all/blast/refFlat.txt";
+  # ...add param options/requirements
+
+  my $os = new OutfileStack(
+			    "-use_basename" => 1,
+			    "-start_file" => $f_in
+			   );
+
+  #
+  #  transcriptome ambiguity:
+  #
+  my $f_ambig = $os->add_level("-suffix" => "ambig.tab");
+
+  unless (-s $f_ambig) {
+    # mux.pl -template 'fusion_contig_extension.pl -transcriptome-annotate %s -transcriptome-fasta refseq.fa' -file set10a.tab.patch_features.tab -count 250 -suffix ambig.tab -ram 2000 -wait 10 -clean glob
+
+    my $cmd = "mux.pl -template 'fusion_contig_extension.pl -transcriptome-annotate %s -transcriptome-fasta ";
+    $cmd .= $f_transcriptome_fasta . "'";
+    $cmd .= " -file " . $os->get_previous_file;
+    $cmd .= " -count 250 -suffix ambig.tab -ram 2000 -wait 10 -clean glob";
+
+    system $cmd;
+    die "$cmd exited with $?" if $?;
+  }
+  die unless -s $f_ambig;
+
+  #
+  #  readthrough annotations:
+  #
+  # fusion_contig_extension.pl -readthrough-annotate set10a.tab.patch_features.tab.ambig.tab -refflat /home/medmonso/work/steve/2020_06_13_cicero_contig_extension/2021_01_04_all/blast/refFlat.txt -genome GRCh37-lite
+
+  my $template = sprintf 'fusion_contig_extension.pl -readthrough-annotate %%s -refflat %s -genome GRCh37-lite', $f_refflat;
+
+  $os->add_level_and_run(
+			 "-suffix" => "readthrough.tab",
+			 "-template" => $template
+			);
+
+  #
+  #  frame-checking:
+  #
+  my $f_frame = $os->add_level("-suffix" => "frame.tab");
+  unless (-s $f_frame) {
+    my $f_in = $os->get_previous_file();
+    # FIRST, build required genbank cache, single-threaded.
+    # WARNING: mux'ing this risks a traffic-based ban from GenBank!
+    my $cmd = sprintf "fz2_framecheck.pl -file %s -genome GRCh37-lite -build-genbank-cache -cache-only", $f_in;
+    if (0) {
+      printf STDERR "frame-check: building genbank cacne...\n";
+      system($cmd);
+      die if $?;
+    } else {
+      print STDERR "DEBUG: skip genbank cache build\n";
+    }
+
+    # after cache is built, safe to use mux.pl to run checks:
+    $cmd = "mux.pl -template 'fz2_framecheck.pl -file %s -genome GRCh37-lite'";
+    $cmd .= " -file " . $f_in;
+    $cmd .= " -count 100 -suffix frame.tab -ram 2000 -wait 10 -clean glob";
+
+    system $cmd;
+    die "$cmd exited with $?" if $?;
+  }
+  die unless -s $f_frame;
+
+
+  $template = 'fusion_contig_extension.pl -patch-genome %s';
+  $os->add_level_and_run(
+			 "-suffix" => "genome.tab",
+			 "-template" => $template
+			);
+  # hack, this should not be necessary in the future
+
+  $template = 'fusion_contig_extension.pl -genome GRCh37-lite -add-preferred-key %s';
+  $os->add_level_and_run(
+			 "-suffix" => "sjpi.tab",
+			 "-template" => $template
+			);
+  # standard postprocessing annotation
+
+  $template = 'fusion_contig_extension.pl -patch-gene-pair-summary-extended -patterns %s';
+  $os->add_level_and_run(
+			 "-suffix" => "gpse.tab",
+			 "-template" => $template
+			);
+  # hack, this should not be necessary in the future
+
+  #
+  #  summarize final file:
+  #
+  missing_field_report($os->get_current_file());
+  # TO DO: some kind of field-level checking, some fields are OK
+  # to be blank, but others aren't
+
+  die "X";
+}
+
+sub missing_field_report {
+  # TO DO:
+  # - report percentages
+  # - sort by count, for not-100%-missing
+  my ($f, $h_out) = @_;
+  unless ($h_out) {
+    my $df = new DelimitedFile(
+			       "-file" => $f,
+			       "-headers" => 1,
+			      );
+    $h_out = $df->headers_raw();
+  }
+
+  my %missing;
+  my $df = new DelimitedFile(
+			     "-file" => $f,
+			     "-headers" => 1,
+			    );
+  my $row_count = 0;
+  while (my $row = $df->get_hash()) {
+    $row_count++;
+    foreach my $h (@{$h_out}) {
+      if (not(exists $row->{$h}) or length($row->{$h}) == 0) {
+	$missing{$h}++;
+	# might be harmless, e.g. pathogenicity_somatic
+      }
+    }
+  }
+  my $blank_column_count = 0;
+  if (%missing) {
+    printf STDERR "blank fields in %s:\n", $f;
+    foreach my $h (sort keys %missing) {
+      my $mc = $missing{$h};
+      printf STDERR "  %s: %d", $h, $mc;
+      if ($mc == $row_count) {
+	printf STDERR " *** WARNING: ALL ROWS BLANK ***";
+	$blank_column_count++;
+      }
+      print STDERR "\n";
+    }
+
+    printf STDERR "  ===> completely blank columns: %d\n", $blank_column_count;
+  }
+}
+
+sub strand_patch {
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+
+  my $rff = get_refflat();
+
+  my @h_new = (
+	       $F_P_ORT_A,
+	       $F_P_ORT_B
+	      );
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $h_needed = detect_needed_headers($df, \@h_new);
+  my $f_out = basename($f_patterns) . ".strand.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+			      "-extra" => $h_needed,
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  while (my $row = $df->get_hash()) {
+#    dump_die($row, "Debug", 1);
+    foreach my $side (qw(A B)) {
+      my $f_acc = sprintf 'gene%s_acc', lc($side);
+      my $f_acc_pref = sprintf 'gte_%s_transcript', uc($side);
+      my @accs = split /,/, $row->{$f_acc};
+      my $acc;
+      if (@accs == 1) {
+	$acc = $accs[0];
+      } else {
+	$acc = $row->{$f_acc_pref};
+      }
+      die "need acc salvage" unless $acc;
+      set_rf_strand($row, $side, $rff, $acc);
+    }
+
+    $rpt->end_row($row);
+  }
+
+  $rpt->finish();
+
+}
+
+sub set_rf_strand {
+  my ($row, $side, $rff, $acc) = @_;
+  #  my $f_chr = "chr" . $side;
+  #  my $f_pos = "pos" . $side;
+  my $f_strand = sprintf "gene%s_strand", lc($side);
+
+  my $process = 1;
+  $process = 0 if $row->{$f_strand};
+  # to to: option to clobber?
+
+  my $set;
+  my $rf;
+  if ($process and $acc) {
+    if ($set = $rff->find_by_accession($acc, "-warn-mismatch" => 1)) {
+      my %strands = map {$_->{strand}, 1} @{$set};
+      if (scalar keys %strands > 1) {
+	printf STDERR "WARNING: multiple strand mappings for %s\n", $acc;
+      } else {
+	my ($strand) = keys %strands;
+	$row->{$f_strand} = $strand;
+	printf STDERR "set strand for %s to %s\n", $acc, $strand;
+      }
+    } else {
+      printf STDERR "WARNING: can't find refflat entry for %s\n", $acc;
+    }
+  }
+
+}
+
+
+sub report_missing_fields {
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  my $header_policy = $FLAGS{"header-policy"} || die "-header-policy core|all";
+
+  my $h_check;
+  if ($header_policy eq "core") {
+    # minimum core pattern file fields only:
+    # problems here are most critical
+    $h_check = \@H_FZ2_CORE;
+  } elsif ($header_policy eq "all") {
+    my $df = new DelimitedFile(
+			       "-file" => $f_patterns,
+			       "-headers" => 1,
+			      );
+    $h_check = $df->headers_raw();
+  } else {
+    die "only core|all header policies implemented";
+  }
+  die unless $h_check;
+
+  missing_field_report($f_patterns, $h_check);
+}
+
+sub patch_genome {
+  # HACK, in the future should not be necessary
+  my $f_in = $FLAGS{"patch-genome"} || die;
+  my $df = new DelimitedFile(
+			     "-file" => $f_in,
+			     "-headers" => 1,
+			     );
+  my $f_out = basename($f_in) . ".genome.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  while (my $row = $df->get_hash()) {
+    die "no genome field" unless exists $row->{genome};
+    # hack
+    $row->{genome} = 37 unless $row->{genome};
+    $rpt->end_row($row);
+  }
+
+  $rpt->finish();
+}
+
+sub patch_gene_pair_summary_extended {
+  # only needed for old data without this field populated.
+  # this is a "lite" patch that only works for records
+  # with single (non-merged) values for annotation fields.
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  my $f_out = basename($f_patterns) . ".gpse.tab";
+
+  my $df = new DelimitedFile("-file" => $f_patterns,
+			     "-headers" => 1,
+			     );
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+  			      "-auto_qc" => 1,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  my @fields = (
+		$F_GENOME,
+
+		$F_P_GENE_A,
+		$F_P_ACC_A,
+		$F_P_FEATURE_A,
+		$F_P_CHR_A,
+		$F_P_POS_A,
+
+		$F_P_GENE_B,
+		$F_P_ACC_B,
+		$F_P_FEATURE_B,
+		$F_P_CHR_B,
+		$F_P_POS_B,
+	       );
+
+  my $already_populated = 0;
+  my $unpatchable = 0;
+  my $patched = 0;
+
+  while (my $row = $df->get_hash()) {
+    die unless exists $row->{$F_GENE_PAIR_SUMMARY_EXTENDED};
+    # patch only
+    my $patchable = 1;
+    $patchable = 0 if $row->{$F_GENE_PAIR_SUMMARY_EXTENDED};
+    if ($patchable) {
+      foreach my $f (@fields) {
+	my $v = $row->{$f};
+	$patchable = 0 unless length($v);
+	$patchable = 0 if $v =~ /,/;
+	# condensed
+	#	dump_die($row, "$f merged") if $v =~ /,/;
+      }
+      if ($patchable) {
+#	dump_die($row, "patchable");
+	my $ext_a = join "/", @{$row}{
+				     $F_P_GENE_A,
+				     $F_P_ACC_A,
+				     $F_P_FEATURE_A,
+				     $F_GENOME,
+				     $F_P_CHR_A,
+				     $F_P_POS_A
+				    };
+	my $ext_b = join "/", @{$row}{
+				     $F_P_GENE_B,
+				     $F_P_ACC_B,
+				     $F_P_FEATURE_B,
+				     $F_GENOME,
+				     $F_P_CHR_B,
+				     $F_P_POS_B
+				    };
+	$row->{$F_GENE_PAIR_SUMMARY_EXTENDED} = join "-", $ext_a, $ext_b;
+	$patched++;
+      } else {
+	# missing/ambiguous data
+	$unpatchable++;
+      }
+    } else {
+      $already_populated++;
+    }
+    $rpt->end_row($row);
+  }
+  $rpt->finish();
+
+  printf STDERR "already_populated:%d  unpatchable:%d  patched:%d\n",
+    $already_populated, $unpatchable, $patched;
+
+  #my $ext_a = join "/", @{$r}{qw(genea_symbol genea_acc genea_feature),
+  #				$F_GENOME, "genea_chr", "genea_pos"};
+  #my $ext_b = join "/", @{$r}{qw(geneb_symbol geneb_acc geneb_feature),
+  # $F_GENOME, "geneb_chr", "geneb_pos"};
+}
+
+sub patch_category {
+  my $f_patterns = $FLAGS{patterns} || die "-patterns";
+  my $f_fusion = $FLAGS{"category-fusion"} || die;
+  my $f_itd = $FLAGS{"category-itd"} || die;
+  my $f_patterns_restrict = $FLAGS{"patterns-restrict"} || die "-patterns-restrict";
+  # only allow annotation for patterns in this file, i.e.
+  # the PRE-MERGED set the categories were built from.
+  # If we don't do this, new patterns which have not been reviewed
+  # will be assigned a category based on gene pair!
+  my $df = new DelimitedFile(
+			     "-file" => $f_patterns_restrict,
+			     "-headers" => 1,
+			    );
+  my %pid_restrict;
+  while (my $row = $df->get_hash()) {
+    $pid_restrict{$row->{pattern}} = 1;
+  }
+
+  #
+  # load fusion category calls:
+  #
+  my %category_pair;
+  $df = new DelimitedFile(
+			  "-file" => $f_fusion,
+			  "-headers" => 1,
+			 );
+  while (my $row = $df->get_hash()) {
+    my $pair = $row->{"FusionName"} || dump_die($row, "FusionName");
+    my $category = $row->{Category} || dump_die($row, "no Category");
+    die if $category_pair{$pair};
+    $category_pair{$pair} = $category;
+  }
+
+  #
+  #  load ITD category calls:
+  #
+  my %category_pattern;
+  $df = new DelimitedFile(
+			  "-file" => $f_itd,
+			  "-headers" => 1,
+			 );
+  while (my $row = $df->get_hash()) {
+    my $category = $row->{Classification} || dump_die($row, "no Classification");
+    my $pid = $row->{"Pattern"} || dump_die($row, "Pattern");
+    die if $category_pattern{$pid};
+    $category_pattern{$pid} = $category;
+  }
+
+  #
+  #  annotate:
+  #
+  $df = new DelimitedFile(
+			  "-file" => $f_patterns,
+			  "-headers" => 1,
+			 );
+  my $f_out = basename($f_patterns) . ".category.tab";
+  my $rpt = $df->get_reporter(
+			      "-file" => $f_out,
+			     );
+
+  # while (my $row = $df->next("-ref" => 1)) {  # headerless
+  my %saw_pair;
+  my %saw_pid;
+
+  my %changes;
+  while (my $row = $df->get_hash()) {
+    die unless exists $row->{category};
+    # patch only
+    my $pid = $row->{pattern} || die;
+    my $pair = $row->{gene_pair} || die;
+
+    my $modifiable = $pid_restrict{$pid} ? 1 : 0;
+    if ($modifiable) {
+      # only allow changes to patterns in set categorization was done on
+      my $category;
+      my $category_current = $row->{$F_P_CATEGORY};
+
+      if (my $cat_pid = $category_pattern{$pid}) {
+	# ITD
+	$category = $cat_pid;
+	$saw_pid{$pid} = 1;
+      } elsif (my $cat_pair = $category_pair{$pair}) {
+	$category = $cat_pair;
+	$saw_pair{$pair} = 1;
+      }
+
+      if ($category) {
+	if ($category_current and $category_current ne $category) {
+	  # changed value
+	  my $change = sprintf '%s to %s', $category_current, $category;
+	  printf STDERR "%s: changed %s\n", $change, $pid;
+	  $changes{$change}++;
+	}
+	$row->{$F_P_CATEGORY} = $category;
+      } elsif ($category_current) {
+	# sanity check
+	die "had $category_current, but no new category";
+      }
+    }
+
+    $rpt->end_row($row);
+  }
+
+  #
+  #  report category changes:
+  #
+  printf STDERR "summary of Category changes:\n";
+  foreach my $change (sort keys %changes) {
+    printf STDERR "  %s: %d\n", $change, $changes{$change};
+  }
+
+
+  #
+  #  sanity check: were all category calls applied?:
+  #
+  my $errors = 0;
+  foreach my $pid (sort keys %category_pattern) {
+    unless ($saw_pid{$pid}) {
+      printf STDERR "ERROR: didn't see pattern $pid\n";
+      $errors++;
+    }
+  }
+
+  foreach my $pair (sort keys %category_pair) {
+    unless ($saw_pair{$pair}) {
+      printf STDERR "ERROR: didn't see pair $pair\n";
+      $errors++;
+    }
+  }
+
+  if ($errors) {
+    if ($FLAGS{"ignore-errors"}) {
+      print STDERR "errors detected, but ignoring.\n";
+    } else {
+      die "errors detected!";
+    }
+  }
+  $rpt->finish();
+
 }
